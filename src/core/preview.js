@@ -25,7 +25,14 @@ export function assetOptions() {
 /** pdf.js source for the current preview bytes (plain data or a range transport for blobs). */
 export function previewSource() {
   const src = store.previewSource
-  if (src && src.transport) return { range: src.transport, length: src.length, disableAutoFetch: true, disableStream: true }
+  if (src && src.blob) {
+    const blob = src.blob
+    const transport = new pdfjs.PDFDataRangeTransport(blob.size, null)
+    transport.requestDataRange = (begin, end) => {
+      blob.slice(begin, end).arrayBuffer().then((b) => transport.onDataRange(begin, new Uint8Array(b)))
+    }
+    return { range: transport, length: blob.size, disableAutoFetch: true, disableStream: true, rangeChunkSize: 256 * 1024 }
+  }
   return { data: store.previewBytes.slice() }
 }
 

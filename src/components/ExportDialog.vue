@@ -67,7 +67,7 @@ async function runExport() {
     const r = await exportPdf(ctx(), o)
     result.value = r
     if (r.verify.ok) {
-      download(r.bytes, `${baseName()}${store.dirty ? '-edited' : ''}.pdf`, 'application/pdf')
+      download(r.blob, `${baseName()}${store.dirty ? '-edited' : ''}.pdf`)
       store.dirty = false
     }
   } catch (e) {
@@ -78,10 +78,10 @@ async function runExport() {
   }
 }
 function forceDownload() {
-  download(result.value.bytes, `${baseName()}-edited.pdf`, 'application/pdf')
+  download(result.value.blob, `${baseName()}-edited.pdf`)
 }
-function exportJson() {
-  const json = exportJSON({ decodeText: jsonDecode.value })
+async function exportJson() {
+  const json = await exportJSON({ decodeText: jsonDecode.value })
   download(JSON.stringify(json, null, 1), `${baseName()}.deepdf.json`, 'application/json')
 }
 </script>
@@ -164,13 +164,14 @@ function exportJson() {
 
         <section v-if="result" class="rounded border p-2" :class="result.verify.ok ? 'border-emerald-700 bg-emerald-950/40' : 'border-red-700 bg-red-950/40'">
           <div class="font-semibold" :class="result.verify.ok ? 'text-emerald-300' : 'text-red-300'">
-            {{ result.verify.ok ? '✓ Exported and verified' : '✗ Verification failed' }} · {{ fmtBytes(result.bytes.length) }}
+            {{ result.verify.ok ? '✓ Exported and verified' : '✗ Verification failed' }} · {{ fmtBytes(result.size) }}
             <span v-if="store.originalSize" class="font-normal text-zinc-400">(original {{ fmtBytes(store.originalSize) }})</span>
           </div>
           <ul class="mt-1 text-zinc-300">
             <li v-for="(l, k) in result.log" :key="k">• {{ l }}</li>
             <li v-if="result.verify.checked">• {{ result.verify.checked }} xref entries point to their objects</li>
             <li v-if="result.verify.reparsed">• Re-parsed {{ result.verify.reparsed }} objects</li>
+            <li v-if="result.verify.note" class="text-zinc-400">• {{ result.verify.note }}</li>
             <li v-for="(p, k) in result.verify.problems" :key="'p' + k" class="text-red-300">• {{ p }}</li>
           </ul>
           <button v-if="!result.verify.ok" class="btn mt-2" @click="forceDownload">Download anyway</button>

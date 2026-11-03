@@ -1,7 +1,7 @@
 // Image XObject extraction in original format (or PNG for raw pixel data).
 import {
   PDFArray, PDFDict, PDFName, PDFStream, N, deref, nameStr, numVal, numArray,
-  decodeStream, rawBytes, filtersOf, stringBytes,
+  decodeStream, rawBytes, filtersOf, stringBytes, rawLength, rawBytesAsync, PDFRawStream,
 } from './pdfobj.js'
 
 const NATIVE = {
@@ -22,7 +22,7 @@ export function imageInfo(ctx, stream) {
     bpc: numVal(deref(ctx, d.get(N('BitsPerComponent')))) || (deref(ctx, d.get(N('ImageMask')))?.asBoolean?.() ? 1 : 8),
     colorSpace: csName || (deref(ctx, d.get(N('ImageMask')))?.asBoolean?.() ? 'Mask' : '?'),
     filters: filtersOf(ctx, stream),
-    size: rawBytes(stream).length,
+    size: rawLength(stream),
   }
 }
 
@@ -137,6 +137,8 @@ export function pixelsToRGBA(ctx, stream, data) {
 
 /** Produce a Blob for preview or download. */
 export async function imageBlob(ctx, stream, preferPng = false) {
+  const bytes = await rawBytesAsync(stream)
+  stream = PDFRawStream.of(stream.dict, bytes) // resident copy for decoding (disk-backed data stays on disk)
   const ex = extractImage(ctx, stream)
   if (ex.kind === 'native' && (!preferPng || ex.browser)) return { blob: new Blob([ex.bytes], { type: ex.mime }), ext: ex.ext, ex }
   if (ex.kind === 'pixels') {

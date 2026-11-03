@@ -55,13 +55,15 @@ export function valueToJSON(ctx, o, opts = {}) {
     case 'stream': {
       const dict = valueToJSON(ctx, o.dict, opts)
       delete dict.Length
+      if (opts.lazyKeys && opts.lazyKeys.has(o)) return { $stream: dict, lazyKey: opts.lazyKeys.get(o) }
+      const resident = opts.bytes && opts.bytes.has(o) ? PDFRawStream.of(o.dict, opts.bytes.get(o)) : o
       if (opts.decodeText !== false) {
-        const d = decodeStream(ctx, o)
+        const d = decodeStream(ctx, resident)
         if (!d.error && !d.remaining.length && isTextLike(d.bytes, 1 << 20) && d.bytes.length < (opts.maxText || 4 << 20)) {
           return { $stream: dict, decoded: true, text: latin1(d.bytes) }
         }
       }
-      return { $stream: dict, base64: b64(rawBytes(o)) }
+      return { $stream: dict, base64: b64(rawBytes(resident) || new Uint8Array()) }
     }
     case 'invalid': return { $invalid: true }
     default: return null
@@ -85,14 +87,14 @@ export function contextToJSON(ctx, opts = {}) {
   }
 }
 
-export function valueFromJSON(ctx, v) {
+export function valueFromJSON(ctx, v, opts = {}) {
   if (v === null || v === undefined) return PDFNull
   if (typeof v === 'boolean') return v ? PDFBool.True : PDFBool.False
   if (typeof v === 'number') return PDFNumber.of(v)
   if (typeof v === 'string') return PDFName.of(v.startsWith('/') ? v.slice(1) : v)
   if (Array.isArray(v)) {
     const a = PDFArray.withContext(ctx)
-    for (const x of v) a.push(valueFromJSON(ctx, x))
+    for (const x of v) a.push(valueFromJSON(ctx, x, opts))
     return a
   }
   if (typeof v === 'object') {
@@ -108,9 +110,12 @@ export function valueFromJSON(ctx, v) {
     if ('$hex' in v) return PDFHexString.of(String(v.$hex).replace(/\s+/g, ''))
     if ('$invalid' in v) return PDFNull
     if ('$stream' in v) {
-      const dict = valueFromJSON(ctx, v.$stream)
+      const dict = valueFromJSON(ctx, v.$stream, opts)
       const s = PDFRawStream.of(dict instanceof PDFDict ? dict : PDFDict.withContext(ctx), new Uint8Array())
-      if (v.decoded) {
+      if (v.lazyKey && opts.lazy && opts.lazy.has(v.lazyKey)) {
+        s.contents = opts.lazy.get(v.lazyKey)
+        s.dict.set(N('Length'), PDFNumber.of(s.contents.length))
+      } else if (v.decoded) {
         const keepFlate = filtersOf(ctx, s).includes('FlateDecode')
         setStreamData(ctx, s, fromLatin1(v.text || ''), keepFlate ? 'flate' : 'none')
       } else {
@@ -120,7 +125,7 @@ export function valueFromJSON(ctx, v) {
       return s
     }
     const d = PDFDict.withContext(ctx)
-    for (const [k, x] of Object.entries(v)) d.set(PDFName.of(k.startsWith('/') ? k.slice(1) : k), valueFromJSON(ctx, x))
+    for (const [k, x] of Object.entries(v)) d.set(PDFName.of(k.startsWith('/') ? k.slice(1) : k), valueFromJSON(ctx, x, opts))
     return d
   }
   return PDFNull
@@ -140,7 +145,7 @@ function fromHexLoose(h) {
   return out
 }
 
-export function contextFromJSON(json) {
+export function contextFromJSON(json, opts = {}) {
   if (!json || json.format !== FORMAT || !json.objects) throw new Error('Not a deePDF JSON description')
   const ctx = PDFContext.create()
   const [maj, min] = String(json.pdfVersion || '1.7').split('.').map(Number)
@@ -148,9 +153,9 @@ export function contextFromJSON(json) {
   for (const [key, v] of Object.entries(json.objects)) {
     const [n, g] = key.trim().split(/\s+/).map(Number)
     if (!Number.isFinite(n)) continue
-    ctx.assign(PDFRef.of(n, g || 0), valueFromJSON(ctx, v))
+    ctx.assign(PDFRef.of(n, g || 0), valueFromJSON(ctx, v, opts))
   }
-  for (const k of ['Root', 'Info', 'ID', 'Encrypt']) if (json.trailer && json.trailer[k] !== undefined) ctx.trailerInfo[k] = valueFromJSON(ctx, json.trailer[k])
+  for (const k of ['Root', 'Info', 'ID', 'Encrypt']) if (json.trailer && json.trailer[k] !== undefined) ctx.trailerInfo[k] = valueFromJSON(ctx, json.trailer[k], opts)
   return ctx
 }
 

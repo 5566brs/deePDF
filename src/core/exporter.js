@@ -1,9 +1,10 @@
 // Export pipeline: clone → strip signatures → validate/fix → gc → renumber → compression → write → verify xref.
-import { PDFContext, PDFWriter, PDFStreamWriter, PDFParser } from 'pdf-lib'
+import { PDFContext, PDFParser } from 'pdf-lib'
+import { writePdf, verifyOffsets } from './writer.js'
 import {
   PDFDict, PDFArray, PDFRef, PDFRawStream, PDFStream, PDFNull, PDFNumber,
-  N, deref, nameStr, cloneObj, collectRefs, mapRefs, decodeStream, setStreamData, filtersOf, rawBytes, makeString,
-  latin1,
+  N, deref, nameStr, cloneObj, collectRefs, mapRefs, decodeStream, setStreamData, filtersOf, rawLength, makeString,
+  latin1, isOnDisk, rawBytesAsync,
 } from './pdfobj.js'
 import { catalog, listPages } from './pages.js'
 import { stripSignatures } from './signature.js'
@@ -67,7 +68,7 @@ export function validate(ctx) {
   const unreachable = objs.length - [...reachable(ctx)].filter((r) => existing.has(r)).length
   if (unreachable > 0) issues.push({ level: 'info', code: 'unused', msg: `${unreachable} object(s) are not referenced from the trailer` })
   let streamsNoLen = 0
-  for (const [, o] of objs) if (o instanceof PDFStream) { const L = deref(ctx, o.dict.get(N('Length'))); if (!(L instanceof PDFNumber) || L.asNumber() !== rawBytes(o).length) streamsNoLen++ }
+  for (const [, o] of objs) if (o instanceof PDFStream) { const L = deref(ctx, o.dict.get(N('Length'))); if (!(L instanceof PDFNumber) || L.asNumber() !== rawLength(o)) streamsNoLen++ }
   if (streamsNoLen) issues.push({ level: 'fix', code: 'length', msg: `${streamsNoLen} stream(s) have an incorrect /Length (rewritten on export)` })
   if (ctx.trailerInfo.Encrypt) issues.push({ level: 'warn', code: 'encrypt', msg: 'Document is encrypted; renumbering objects would break decryption and is disabled' })
   return { issues, objectCount: objs.length, dangling }
@@ -180,7 +181,8 @@ export async function exportPdf(srcCtx, opts) {
       if (filtersOf(ctx, o).length) continue
       const type = nameStr(deref(ctx, o.dict.get(N('Type'))))
       if (type === 'Metadata') continue // XMP should stay readable
-      setStreamData(ctx, o, o.contents, 'flate')
+      const bytes = await rawBytesAsync(o)
+      setStreamData(ctx, o, bytes, 'flate')
       n++
     }
     log.push(`Compressed ${n} uncompressed stream(s) with FlateDecode`)
@@ -190,7 +192,8 @@ export async function exportPdf(srcCtx, opts) {
       if (!(o instanceof PDFRawStream)) continue
       const filters = filtersOf(ctx, o)
       if (!filters.length) continue
-      const d = decodeStream(ctx, o)
+      const work = isOnDisk(o) ? PDFRawStream.of(o.dict, await rawBytesAsync(o)) : o
+      const d = decodeStream(ctx, work)
       if (d.error) continue
       if (!d.remaining.length) { setStreamData(ctx, o, d.bytes, 'none'); n++ }
       else if (d.remaining.length < filters.length) {
@@ -205,60 +208,41 @@ export async function exportPdf(srcCtx, opts) {
     log.push(`Decompressed ${n} stream(s)${partial ? `, ${partial} partially (image codecs kept)` : ''}`)
   }
 
-  let bytes
-  if (opts.objectStreams) {
-    bytes = await PDFStreamWriter.forContext(ctx, 500, true, 50).serializeToBuffer()
-    log.push('Wrote compressed object streams + cross-reference stream')
-  } else {
-    bytes = await PDFWriter.forContext(ctx, 500).serializeToBuffer()
-    log.push('Wrote classic cross-reference table')
-  }
-  const verify = await verifyOutput(bytes, ctx, !opts.objectStreams)
-  return { bytes, log, verify }
+  const w = writePdf(ctx, { objectStreams: !!opts.objectStreams })
+  log.push(w.classic ? 'Wrote classic cross-reference table' : 'Wrote compressed object streams + cross-reference stream')
+  const verify = await verifyOutput(w, ctx)
+  return { blob: w.blob, size: w.blob.size, log, verify }
 }
 
-/** Verify that every xref entry points at the right "n g obj" header and object count matches. */
-export async function verifyOutput(bytes, ctx, classic) {
+/**
+ * Verify the written file: every directly stored object's xref offset must point at its "n g obj" header,
+ * and (for files up to 64 MB) the output is re-parsed and the object count compared.
+ */
+export async function verifyOutput(w, ctx) {
   const res = { ok: true, checked: 0, problems: [] }
-  if (classic) {
-    const tail = latin1(bytes.subarray(Math.max(0, bytes.length - 1024)))
-    const m = tail.match(/startxref\s+(\d+)/)
-    if (!m) { res.ok = false; res.problems.push('startxref not found'); return res }
-    const xrefOff = +m[1]
-    const head = latin1(bytes.subarray(xrefOff, xrefOff + 4))
-    if (head !== 'xref') { res.ok = false; res.problems.push('startxref does not point to xref'); return res }
-    const text = latin1(bytes.subarray(xrefOff, bytes.length))
-    const lines = text.split(/\r?\n|\r/)
-    let li = 1
-    while (li < lines.length && /^\d+\s+\d+\s*$/.test(lines[li].trim())) {
-      const [start, count] = lines[li].trim().split(/\s+/).map(Number)
-      li++
-      for (let k = 0; k < count; k++, li++) {
-        const e = lines[li] || ''
-        const mm = e.match(/^(\d{10}) (\d{5}) ([nf])/)
-        if (!mm) { res.ok = false; res.problems.push(`malformed xref entry for object ${start + k}`); continue }
-        if (mm[3] !== 'n') continue
-        const off = +mm[1], gen = +mm[2]
-        const hdr = latin1(bytes.subarray(off, off + 32))
-        const want = new RegExp(`^${start + k}\\s+${gen}\\s+obj`)
-        res.checked++
-        if (!want.test(hdr)) { res.ok = false; res.problems.push(`object ${start + k} ${gen}: xref offset ${off} does not point to its header`) }
-      }
+  const v = await verifyOffsets(w.blob, w.offsets)
+  res.checked = v.checked
+  res.sampled = v.sampled
+  res.problems.push(...v.problems)
+  // the xref section itself
+  const tailBytes = new Uint8Array(await w.blob.slice(Math.max(0, w.blob.size - 64)).arrayBuffer())
+  const m = latin1(tailBytes).match(/startxref\s+(\d+)/)
+  if (!m || +m[1] !== w.xrefOffset) res.problems.push('startxref does not point to the cross-reference section')
+  if (v.whole) {
+    try {
+      const parsed = await PDFParser.forBytesWithOptions(v.whole, 1000, false, false).parseDocument()
+      const a = parsed.enumerateIndirectObjects().length
+      const b = ctx.enumerateIndirectObjects().length
+      if (a !== b) res.problems.push(`re-parsed object count ${a} ≠ written ${b}`)
+      res.reparsed = a
+    } catch (e) {
+      res.problems.push('re-parse failed: ' + (e.message || e))
     }
-  }
-  try {
-    const parsed = await PDFParser.forBytesWithOptions(bytes, 1000, false, false).parseDocument()
-    const a = parsed.enumerateIndirectObjects().length
-    const b = ctx.enumerateIndirectObjects().length
-    if (a !== b) { res.ok = false; res.problems.push(`re-parsed object count ${a} ≠ written ${b}`) }
-    res.reparsed = a
-  } catch (e) {
-    res.ok = false
-    res.problems.push('re-parse failed: ' + (e.message || e))
-  }
+  } else res.note = 'File larger than 64 MB: offsets verified by sampling, full re-parse skipped'
+  res.ok = res.problems.length === 0
   return res
 }
 
-export async function serializeForPreview(ctx) {
-  return PDFWriter.forContext(ctx, 2000).serializeToBuffer()
+export function serializeForPreview(ctx) {
+  return writePdf(ctx, { objectStreams: false }).blob
 }

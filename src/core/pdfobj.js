@@ -4,6 +4,7 @@ import {
   PDFNull, PDFRef, PDFRawStream, PDFStream, PDFInvalidObject, decodePDFRawStream,
 } from 'pdf-lib'
 import pako from 'pako'
+import { isLazy, cachedBytes, loadLazy } from './lazy.js'
 
 export { PDFDict, PDFArray, PDFName, PDFNumber, PDFString, PDFHexString, PDFBool, PDFNull, PDFRef, PDFRawStream, PDFStream }
 
@@ -272,7 +273,8 @@ function decodeWithPdfLib(ctx, filter, bytes) {
  * Returns { bytes, remaining: [filters not applied], error }
  */
 export function decodeStream(ctx, stream) {
-  const raw = stream instanceof PDFRawStream ? stream.contents : stream.getContents()
+  const raw = rawBytes(stream)
+  if (!raw) return { bytes: new Uint8Array(), remaining: filtersOf(ctx, stream), error: null, notLoaded: true }
   const filters = filtersOf(ctx, stream).map((f) => FILTER_ALIASES[f] || f)
   let data = raw
   for (let i = 0; i < filters.length; i++) {
@@ -290,8 +292,31 @@ export function decodeStream(ctx, stream) {
   return { bytes: data, remaining: [], error: null }
 }
 
+/** Raw (encoded) bytes if they are in memory; null for disk-backed data that is not cached. */
 export function rawBytes(stream) {
-  return stream instanceof PDFRawStream ? stream.contents : stream.getContents()
+  if (!(stream instanceof PDFRawStream)) return stream.getContents()
+  const c = stream.contents
+  return isLazy(c) ? cachedBytes(c) : c
+}
+export function rawLength(stream) {
+  return stream instanceof PDFRawStream ? stream.contents.length : stream.getContents().length
+}
+export function isOnDisk(stream) {
+  return stream instanceof PDFRawStream && isLazy(stream.contents)
+}
+/** Raw bytes, loading disk-backed data if needed. */
+export async function rawBytesAsync(stream) {
+  if (stream instanceof PDFRawStream && isLazy(stream.contents)) return loadLazy(stream.contents)
+  return rawBytes(stream)
+}
+export async function decodeStreamAsync(ctx, stream) {
+  await rawBytesAsync(stream)
+  const d = decodeStream(ctx, stream)
+  if (d.notLoaded) { // evicted between calls (tiny cache) – decode from a temporary copy
+    const bytes = await rawBytesAsync(stream)
+    return decodeStream(ctx, PDFRawStream.of(stream.dict, bytes))
+  }
+  return d
 }
 
 /**
@@ -375,7 +400,7 @@ export function shortValue(ctx, o, depth = 0) {
     case 'stream': {
       const t = typeLabel(ctx, o)
       const f = filtersOf(ctx, o)
-      return `stream${t ? ' ' + t : ''} ${rawBytes(o).length} B${f.length ? ' ' + f.join(',') : ''}`
+      return `stream${t ? ' ' + t : ''} ${rawLength(o)} B${f.length ? ' ' + f.join(',') : ''}${isOnDisk(o) ? ' (on disk)' : ''}`
     }
     case 'invalid': return '(invalid object)'
     default: return '?'

@@ -5,6 +5,10 @@ import { cloneObj, PDFRef, deref, N, PDFDict, numArray } from './pdfobj.js'
 import { listPages, buildLocationIndex, locateXObject, pageBox, normRect } from './pages.js'
 import { detectSignatures } from './signature.js'
 import { serializeForPreview } from './exporter.js'
+import { parsePdf } from './loader.js'
+import { isLazy, LazyContents, loadLazy, idbPutBlob, idbGetBlob, idbClear } from './lazy.js'
+
+export const memorySettings = { threshold: 256 * 1024, inlinePreviewLimit: 48 * 1024 * 1024 }
 import { contextToJSON, contextFromJSON } from './jsonDesc.js'
 
 const UNDO_LIMIT = 40
@@ -27,7 +31,8 @@ export const store = reactive({
   undo: [],
   redo: [],
   previewBytes: null,
-  previewSource: null, // { transport, length } when the document is served from a Blob
+  previewSource: null,
+  offloaded: null, // { count, bytes } streams kept on disk at load // { transport, length } when the document is served from a Blob
   previewRev: 0,
   previewBusy: false,
   pick: null, // { page, x, y, n } click in preview
@@ -63,12 +68,12 @@ function afterLoad(context, name, size) {
   bump()
 }
 
-export async function loadPdfBytes(bytes, name = 'document.pdf') {
+export async function loadPdfBytes(bytes, name = 'document.pdf', file = null) {
   store.loading = true
   store.error = ''
   try {
-    const parser = PDFParser.forBytesWithOptions(bytes, 2000, false, false)
-    const context = await parser.parseDocument()
+    const { ctx: context, offloaded } = await parsePdf(bytes, { file, threshold: memorySettings.threshold })
+    store.offloaded = offloaded
     afterLoad(context, name, bytes.length)
     if (store.encrypted) {
       // pdf-lib cannot decrypt; the preview uses the original bytes until the first edit.
@@ -88,8 +93,51 @@ export function loadJSON(json, name) {
   afterLoad(context, name.replace(/\.json$/i, '') || 'document.pdf', 0)
 }
 
-export function exportJSON(opts) {
-  return contextToJSON(ctx(), opts)
+/** Full JSON description (disk-backed streams are read in for this). */
+export async function exportJSON(opts) {
+  const c = ctx()
+  const bytes = new Map()
+  for (const [, o] of c.enumerateIndirectObjects()) if (o && o.contents && isLazy(o.contents)) bytes.set(o, await loadLazy(o.contents))
+  return contextToJSON(c, { ...opts, bytes })
+}
+
+function collectLazyKeys(json) {
+  const out = []
+  for (const v of Object.values(json.objects || {})) if (v && typeof v === 'object' && v.$stream && v.lazyKey) out.push(v.lazyKey)
+  return out
+}
+
+/** Memory usage: resident vs disk-backed stream data. */
+export function memoryStats() {
+  const c = ctx()
+  let resident = 0, onDisk = 0, lazyCount = 0
+  if (c) for (const [, o] of c.enumerateIndirectObjects()) {
+    if (!o || !o.contents) continue
+    if (isLazy(o.contents)) { onDisk += o.contents.length; lazyCount++ } else resident += o.contents.length
+  }
+  return { resident, onDisk, lazyCount }
+}
+
+/** Move large in-memory binary streams (e.g. replaced images) to IndexedDB. */
+export async function offloadLargeStreams(threshold = memorySettings.threshold) {
+  const c = ctx()
+  let n = 0, bytes = 0
+  for (const [ref, o] of c.enumerateIndirectObjects()) {
+    if (!o || !o.contents || isLazy(o.contents) || o.contents.length < threshold) continue
+    const st = o.dict.get(N('Subtype'))
+    const isImage = st && st.decodeText && st.decodeText() === 'Image'
+    const isFont = o.dict.has(N('Length1')) || o.dict.has(N('Length2'))
+    const isFile = o.dict.get(N('Type'))?.decodeText?.() === 'EmbeddedFile'
+    if (!isImage && !isFont && !isFile) continue
+    const key = `live:${ref.objectNumber}:${Date.now()}`
+    await idbPutBlob(key, new Blob([o.contents]))
+    const blob = await idbGetBlob(key)
+    bytes += o.contents.length
+    o.contents = new LazyContents(blob, 'idb')
+    n++
+  }
+  bump()
+  return { n, bytes }
 }
 
 /* ---------- undo / redo snapshots ---------- */
@@ -175,9 +223,18 @@ async function regeneratePreview() {
   const seq = ++previewSeq
   store.previewBusy = true
   try {
-    const bytes = await serializeForPreview(c)
-    if (seq !== previewSeq) return
-    store.previewBytes = markRaw(bytes)
+    const blob = serializeForPreview(c)
+    if (blob.size <= memorySettings.inlinePreviewLimit) {
+      const bytes = new Uint8Array(await blob.arrayBuffer())
+      if (seq !== previewSeq) return
+      store.previewSource = null
+      store.previewBytes = markRaw(bytes)
+    } else {
+      // large document: pdf.js reads byte ranges from the (mostly disk-backed) Blob
+      if (seq !== previewSeq) return
+      store.previewBytes = null
+      store.previewSource = markRaw({ blob, length: blob.size })
+    }
     store.previewRev++
   } catch (e) {
     console.error(e)
@@ -249,7 +306,18 @@ function idb() {
 }
 export async function saveDraft() {
   const db = await idb()
-  const data = { name: store.fileName, savedAt: new Date().toISOString(), json: exportJSON({ decodeText: false }) }
+  // disk-backed streams go to the IndexedDB blob store; the JSON only references them
+  await idbClear('draft:')
+  const lazyKeys = new Map()
+  let k = 0
+  for (const [, o] of ctx().enumerateIndirectObjects()) {
+    if (o && o.contents && isLazy(o.contents)) {
+      const key = `draft:${++k}`
+      await idbPutBlob(key, o.contents.blob)
+      lazyKeys.set(o, key)
+    }
+  }
+  const data = { name: store.fileName, savedAt: new Date().toISOString(), json: contextToJSON(ctx(), { decodeText: false, lazyKeys }) }
   await new Promise((res, rej) => {
     const tx = db.transaction('drafts', 'readwrite')
     tx.objectStore('drafts').put(data, 'current')
@@ -267,7 +335,12 @@ export async function loadDraft() {
     r.onerror = () => rej(r.error)
   })
   if (!data) { notify('No saved draft found', 'warn'); return }
-  loadJSON(data.json, data.name)
+  const blobs = new Map()
+  for (const key of collectLazyKeys(data.json)) {
+    const b = await idbGetBlob(key)
+    if (b) blobs.set(key, new LazyContents(b, 'idb'))
+  }
+  afterLoad(contextFromJSON(data.json, { lazy: blobs }), data.name, 0)
   store.dirty = true
   notify(`Draft restored (${new Date(data.savedAt).toLocaleString()})`)
 }

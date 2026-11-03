@@ -20,6 +20,39 @@ Cloudflare Pages.
 | **Signatures** | Signed documents show a warning; exports are written without the signature (signature values, `/Perms`, `/DSS` removed; empty fields kept). |
 | **Other** | Undo/redo (Ctrl+Z / Ctrl+Shift+Z), drafts saved in the browser (IndexedDB), hover explanations for keys and operators, focus-to-locate animation in the preview, responsive layout. |
 
+### Editing content streams
+
+* Every operation line shows **operand chips** with a tooltip explaining what that operand does *in this line*
+  (e.g. “Fill blue component (0–1) → resulting colour #1a4d8f”, “e – x position of the text origin”,
+  “Position adjustment −200: moves the next glyph right by 0.2 em = 6.4 units at 32pt”, decoded font name…).
+* The **caret is followed on the preview**: the locate animation highlights exactly the part under the caret —
+  a single glyph inside a string, a TJ kerning gap, a path point, a rectangle edge, the box an image lands in.
+  Colour / line / font / matrix operators highlight everything they affect.
+* Strings are **decoded through the font** (ToUnicode CMaps, encodings, `Differences`, multi-byte CID fonts),
+  so Hebrew and other scripts are readable. You can type replacement text: it is encoded back through the font
+  and you get immediate feedback about characters the (subset) font does not contain. Text stored in visual
+  order (`/ReversedChars`) is detected. Glyph chips allow duplicating or deleting single characters.
+* **Glyphs**: each font can show its glyph outlines (via pdf.js font conversion + opentype.js) and export them as
+  individual SVG, an SVG sheet or JSON, or copy a glyph's PDF code for pasting into a string.
+
+### HTML export
+
+Self-contained, print-faithful HTML: every page is an inline SVG in which each vector drawing is its own `<path>`,
+text is `<text>` (real Unicode — the embedded fonts get a rebuilt cmap — rendered with the embedded fonts as
+`@font-face` data URIs), and raster images stay `<image>`. pdf.js does the PDF interpretation; its drawing calls are
+recorded as SVG. Each page is then rasterised and compared pixel by pixel with the pdf.js rendering; the dialog
+shows the match per page and a diff map, and lists anything that had to be approximated (e.g. soft-mask groups and
+tiling patterns, which pdf.js itself rasterises). Named `@page` rules keep each page's size when printing.
+
+### Memory
+
+Large binary streams (images, font programs, embedded files) are never copied into memory: after parsing they
+remain disk-backed `Blob` slices of the opened file (or Blobs in IndexedDB for drafts and replaced data) and are
+read on demand through a small LRU cache. The PDF writer produces a `Blob` that references those slices, the preview
+of large documents is fed to pdf.js by byte ranges, and export verification reads only the bytes it checks. The
+header shows how much stream data is in RAM versus on disk. Content streams, CMaps and XMP stay in memory because
+they are edited interactively.
+
 Focusing any input that belongs to something on a page (an element, an operator, an annotation, a page box,
 an image XObject …) scrolls the preview to it and plays a converging ring animation around it.
 
@@ -29,6 +62,7 @@ an image XObject …) scrolls the preview to it and plays a converging ring anim
 * [pdf-lib](https://pdf-lib.js.org/) – low-level object model, parser and writer
 * [pdf.js](https://mozilla.github.io/pdf.js/) – rendering of the preview
 * [pako](https://github.com/nodeca/pako) – Flate compression
+* [opentype.js](https://opentype.js.org/) – glyph outlines and cmap rebuilding for glyph / HTML export
 
 ## Development
 
@@ -53,3 +87,7 @@ npm run selftest -- sample.pdf   # node smoke test of the core (parse, edit, exp
 * Element bounding boxes are computed by a lightweight content-stream interpreter (approximate text widths
   when fonts have no `/Widths`).
 * Duplicated form widgets are not added to the AcroForm field list.
+* Undo history keeps references to replaced stream data, so replaced large streams stay in memory until they leave
+  the undo history (40 steps).
+* HTML export: soft-mask groups, tiling patterns and mesh shadings are drawn by pdf.js into bitmaps and therefore
+  appear as images; the verification report shows them.

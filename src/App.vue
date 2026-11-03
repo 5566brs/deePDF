@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
-import { store, ctxRef, loadPdfBytes, loadJSON, undo, redo, saveDraft, loadDraft, draftInfo, notify } from './core/store.js'
+import { store, ctxRef, loadPdfBytes, loadJSON, undo, redo, saveDraft, loadDraft, draftInfo, notify, memoryStats } from './core/store.js'
 import { fmtBytes } from './core/pdfobj.js'
 import PreviewPane from './components/PreviewPane.vue'
 import PagesTab from './components/PagesTab.vue'
@@ -38,7 +38,7 @@ async function openFile(file) {
     }
     return
   }
-  await loadPdfBytes(buf, file.name)
+  await loadPdfBytes(buf, file.name, file)
 }
 function onPick(e) { openFile(e.target.files[0]); e.target.value = '' }
 
@@ -86,6 +86,7 @@ onBeforeUnmount(() => {
 })
 
 const sig = computed(() => store.signature)
+const mem = computed(() => { store.rev; return memoryStats() })
 </script>
 
 <template>
@@ -108,6 +109,7 @@ const sig = computed(() => store.signature)
           <span class="hidden text-zinc-200 sm:inline">{{ store.fileName }}</span>
           <span class="hidden md:inline"> · {{ store.pageCount }} page{{ store.pageCount === 1 ? '' : 's' }}<template v-if="store.originalSize"> · {{ fmtBytes(store.originalSize) }}</template></span>
           <span v-if="store.dirty" class="ml-1 text-amber-400" v-tip="'There are unsaved changes'">●</span>
+          <span class="ml-2 hidden font-mono text-[10px] text-zinc-500 lg:inline" v-tip="`Stream data held in memory: ${fmtBytes(mem.resident)}\nStream data kept on disk (slices of the opened file / IndexedDB, read only when opened or exported): ${fmtBytes(mem.onDisk)} in ${mem.lazyCount} stream(s)`">RAM {{ fmtBytes(mem.resident) }}<template v-if="mem.onDisk"> · disk {{ fmtBytes(mem.onDisk) }}</template></span>
           <span v-if="store.previewBusy" class="ml-2 text-zinc-500">rendering…</span>
         </div>
         <div class="flex rounded border border-zinc-700 lg:hidden">

@@ -10,7 +10,7 @@ import {
   fmtBytes, fmtNum, latin1, fromLatin1,
 } from '../core/pdfobj.js'
 import { imageInfo, imageBlob, fontFileOf, isImageXObject } from '../core/images.js'
-import { decodeStream } from '../core/pdfobj.js'
+import { decodeStreamAsync } from '../core/pdfobj.js'
 import ElementNode from './ElementNode.vue'
 import ObjectNode from './ObjectNode.vue'
 import GlyphDialog from './GlyphDialog.vue'
@@ -487,8 +487,8 @@ async function exportXObject(x, png) {
   const { blob, ext } = await imageBlob(ctx(), o, png)
   download(blob, `${baseName()}-p${store.currentPage + 1}-${x.name}.${ext}`)
 }
-function exportFont(f) {
-  const d = decodeStream(ctx(), f.file.stream)
+async function exportFont(f) {
+  const d = await decodeStreamAsync(ctx(), f.file.stream)
   download(d.bytes, `${baseName()}-${(f.base || f.name).replace(/[^\w.+-]/g, '_')}.${f.file.ext}`)
 }
 const glyphFont = ref(null)

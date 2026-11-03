@@ -2,7 +2,7 @@
 // Objects view: tree from the trailer, or a flat filterable list of all indirect objects.
 import { computed, ref, watch, nextTick } from 'vue'
 import { store, ctx, mutate, notify } from '../core/store.js'
-import { kindOf, typeLabel, shortValue, cloneObj, PDFRef, PDFDict, collectRefs, rawBytes, PDFStream, fmtBytes } from '../core/pdfobj.js'
+import { kindOf, typeLabel, shortValue, cloneObj, PDFRef, PDFDict, collectRefs, rawLength, PDFStream, fmtBytes } from '../core/pdfobj.js'
 import { validate } from '../core/exporter.js'
 import ObjectNode from './ObjectNode.vue'
 
@@ -35,7 +35,7 @@ const filtered = computed(() => {
 })
 const stats = computed(() => {
   let streams = 0, bytes = 0
-  for (const o of objects.value) if (o.obj instanceof PDFStream) { streams++; bytes += rawBytes(o.obj).length }
+  for (const o of objects.value) if (o.obj instanceof PDFStream) { streams++; bytes += rawLength(o.obj) }
   return { streams, bytes }
 })
 

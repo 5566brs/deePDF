@@ -1,10 +1,10 @@
 <script setup>
 // Stream data viewer/editor: decodes the stream, lets you edit it as operators, text or replace it, re-encodes on save.
 import { computed, ref, watch, onBeforeUnmount, provide } from 'vue'
-import { store, ctx, mutate, locate, locationIndex, download, notify, baseName } from '../core/store.js'
+import { store, ctx, mutate, locate, locationIndex, download, notify, baseName, offloadLargeStreams, memorySettings } from '../core/store.js'
 import {
-  decodeStream, filtersOf, rawBytes, setStreamData, setStreamRaw, isTextLike, latin1, fromLatin1, toHex, fmtBytes,
-  PDFStream, N, deref, nameStr,
+  decodeStream, filtersOf, setStreamData, setStreamRaw, isTextLike, latin1, fromLatin1, toHex, fmtBytes,
+  PDFStream, N, deref, nameStr, rawLength, isOnDisk, rawBytesAsync, PDFRawStream,
 } from '../core/pdfobj.js'
 import { parseContent, serializeOps, computeBoxes } from '../core/contentStream.js'
 import { makeEnv, listPages, fontDictByName } from '../core/pages.js'
@@ -16,8 +16,10 @@ import OpLine from './OpLine.vue'
 const props = defineProps({ streamRef: Object })
 
 const stream = computed(() => { store.rev; const s = ctx().lookup(props.streamRef); return s instanceof PDFStream ? s : null })
+const loadTick = ref(0)
 const info = computed(() => {
   store.rev
+  loadTick.value
   const s = stream.value
   if (!s) return null
   const c = ctx()
@@ -27,7 +29,7 @@ const info = computed(() => {
   const loc = locationIndex().get(props.streamRef)
   const isContent = !!(loc && loc.content) || subtype === 'Form' || (deref(c, s.dict.get(N('PatternType')))?.asNumber?.() === 1) || (!type && !subtype && isTextLike(d.bytes) && looksLikeOps(d.bytes))
   return {
-    filters: filtersOf(c, s), raw: rawBytes(s).length, decoded: d.bytes, remaining: d.remaining, error: d.error,
+    filters: filtersOf(c, s), raw: rawLength(s), decoded: d.bytes, remaining: d.remaining, error: d.error, notLoaded: !!d.notLoaded, onDisk: isOnDisk(s),
     type, subtype, isContent, isImage: isImageXObject(c, s), text: isTextLike(d.bytes), loc,
   }
 })
@@ -180,7 +182,15 @@ async function exportImage() {
 
 /* ---------- file I/O ---------- */
 function downloadDecoded() { download(info.value.decoded, `${baseName()}-obj${props.streamRef.objectNumber}-decoded.bin`) }
-function downloadRaw() { download(rawBytes(stream.value), `${baseName()}-obj${props.streamRef.objectNumber}-raw.bin`) }
+async function downloadRaw() {
+  const s = stream.value
+  const c = s.contents
+  download(c && c.blob ? c.blob : await rawBytesAsync(s), `${baseName()}-obj${props.streamRef.objectNumber}-raw.bin`)
+}
+async function loadFromDisk() {
+  await rawBytesAsync(stream.value)
+  loadTick.value++
+}
 const fileIn = ref(null)
 const replaceKind = ref('decoded')
 function pickReplace(kind) { replaceKind.value = kind; fileIn.value.click() }
@@ -192,11 +202,13 @@ async function onReplace(e) {
   if (replaceKind.value === 'raw') mutate('Replace raw stream data', (c) => setStreamRaw(c.lookup(props.streamRef), bytes))
   else mutate('Replace stream data', (c) => setStreamData(c, c.lookup(props.streamRef), bytes, encodeMode.value))
   notify(`Stream replaced (${fmtBytes(bytes.length)})`)
+  if (bytes.length >= memorySettings.threshold) offloadLargeStreams().catch(() => {})
 }
-function recompress(m) {
+async function recompress(m) {
+  const bytes = await rawBytesAsync(stream.value)
   mutate(m === 'flate' ? 'Compress stream' : 'Decompress stream', (c) => {
     const s = c.lookup(props.streamRef)
-    const d = decodeStream(c, s)
+    const d = decodeStream(c, PDFRawStream.of(s.dict, bytes))
     if (d.error || d.remaining.length) throw new Error('Stream cannot be fully decoded')
     setStreamData(c, s, d.bytes, m)
   })
@@ -221,6 +233,11 @@ const MODES = computed(() => {
       <span v-else>no filter</span>
       <span v-if="info.remaining.length" class="text-amber-300" v-tip="'These filters are image codecs or unsupported and are kept as-is'">kept: {{ info.remaining.join(',') }}</span>
       <span v-if="info.error" class="text-red-300">{{ info.error }}</span>
+      <span v-if="info.onDisk" class="tag bg-sky-900/60 text-sky-200" v-tip="'This stream\'s data is not held in memory: it is read from the opened file / IndexedDB when needed.'">on disk</span>
+    </div>
+    <div v-if="info.notLoaded" class="mt-1.5 flex items-center gap-2 text-[11px] text-sky-200">
+      Data ({{ fmtBytes(info.raw) }}) is stored on disk to save memory.
+      <button class="btn" @click="loadFromDisk">Load to view / edit</button>
     </div>
     <div class="mt-1.5 flex flex-wrap items-center gap-1">
       <button v-for="[m, l] in MODES" :key="m" class="btn" :class="{ 'border-orange-500 text-orange-200': mode === m }" @click="mode = m">{{ l }}</button>
