@@ -35,6 +35,7 @@ function setZoom(z) {
 }
 
 function onPick(p) {
+  if (p.edit) { store.tab = 'elements'; store.mobileView = 'editor' }
   store.currentPage = p.page
   store.pick = { ...p, n: Math.random() }
 }

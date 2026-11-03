@@ -1,5 +1,6 @@
 <script setup>
 import { ref, shallowRef, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+
 import { store } from '../core/store.js'
 
 const props = defineProps({ doc: Object, rev: Number, index: Number, scale: Number, estimate: Object })
@@ -97,19 +98,65 @@ watch(hl, (v) => {
   if (!inView) scroller.scrollTo({ top: cy - scroller.clientHeight / 2, left: cx - scroller.clientWidth / 2, behavior: 'smooth' })
 })
 
-function onClick(e) {
-  if (!viewport.value) return
+function pdfPoint(e) {
   const rect = root.value.getBoundingClientRect()
-  const [x, y] = viewport.value.convertToPdfPoint(e.clientX - rect.left, e.clientY - rect.top)
-  emit('pick', { page: props.index, x, y })
+  return viewport.value.convertToPdfPoint(e.clientX - rect.left, e.clientY - rect.top)
+}
+function onClick(e, edit = false) {
+  if (!viewport.value) return
+  const [x, y] = pdfPoint(e)
+  emit('pick', { page: props.index, x, y, edit })
+}
+
+/* ---------- drag to move the selection ---------- */
+const drag = ref(null) // { sx, sy, ox, oy }
+const moveBox = computed(() => {
+  const t = store.moveTarget
+  if (!t || t.page !== props.index || !viewport.value || !t.rect) return null
+  const [a, b] = viewport.value.convertToViewportPoint(t.rect[0], t.rect[1])
+  const [c, d] = viewport.value.convertToViewportPoint(t.rect[2], t.rect[3])
+  return { x: Math.min(a, c), y: Math.min(b, d), w: Math.max(6, Math.abs(c - a)), h: Math.max(6, Math.abs(d - b)) }
+})
+function dragStart(e) {
+  if (e.button !== 0) return
+  e.currentTarget.setPointerCapture(e.pointerId)
+  drag.value = { sx: e.clientX, sy: e.clientY, ox: 0, oy: 0, moved: false }
+}
+function dragMove(e) {
+  if (!drag.value) return
+  drag.value.ox = e.clientX - drag.value.sx
+  drag.value.oy = e.clientY - drag.value.sy
+  if (Math.abs(drag.value.ox) + Math.abs(drag.value.oy) > 3) drag.value.moved = true
+}
+function dragEnd(e) {
+  const d = drag.value
+  drag.value = null
+  if (!d) return
+  if (!d.moved) { onClick(e); return }
+  const rect = root.value.getBoundingClientRect()
+  const [x0, y0] = viewport.value.convertToPdfPoint(d.sx - rect.left, d.sy - rect.top)
+  const [x1, y1] = viewport.value.convertToPdfPoint(e.clientX - rect.left, e.clientY - rect.top)
+  const round = (v) => Math.round(v * 100) / 100
+  store.moveRequest = { page: props.index, dx: round(x1 - x0), dy: round(y1 - y0), kind: store.moveTarget?.kind, n: Math.random() }
 }
 </script>
 
 <template>
-  <div ref="root" class="relative mx-auto bg-white shadow-lg shadow-black/50" :style="{ width: size.w + 'px', height: size.h + 'px' }" :data-page="index" @click="onClick">
+  <div ref="root" class="relative mx-auto bg-white shadow-lg shadow-black/50" :style="{ width: size.w + 'px', height: size.h + 'px' }" :data-page="index" @click="onClick($event)" @dblclick="onClick($event, true)">
     <div ref="holder" class="absolute inset-0" />
     <div v-if="failed" class="absolute inset-0 flex items-center justify-center p-4 text-center text-xs text-red-600">Render error: {{ failed }}</div>
     <div v-if="hl" :key="hl.n" class="locate-ring" :class="{ 'is-point': hl.point }" :style="{ left: hl.x - 2 + 'px', top: hl.y - 2 + 'px', width: hl.w + 4 + 'px', height: hl.h + 4 + 'px' }" />
+    <div
+      v-if="moveBox"
+      class="absolute cursor-move rounded-sm border-2 border-dashed border-amber-400/90 bg-amber-300/5 hover:bg-amber-300/15"
+      :style="{ left: moveBox.x - 3 + 'px', top: moveBox.y - 3 + 'px', width: moveBox.w + 6 + 'px', height: moveBox.h + 6 + 'px', transform: drag ? `translate(${drag.ox}px, ${drag.oy}px)` : '' }"
+      title="Drag to move the selection · double-click to edit its text"
+      @click.stop
+      @dblclick.stop="onClick($event, true)"
+      @pointerdown.stop="dragStart"
+      @pointermove="dragMove"
+      @pointerup="dragEnd"
+    />
     <div class="absolute -left-1 top-0 -translate-x-full pr-1 font-mono text-[10px] text-zinc-500 select-none">{{ index + 1 }}</div>
   </div>
 </template>

@@ -14,6 +14,10 @@ import { decodeStreamAsync } from '../core/pdfobj.js'
 import ElementNode from './ElementNode.vue'
 import ObjectNode from './ObjectNode.vue'
 import GlyphDialog from './GlyphDialog.vue'
+import QuickEdit from './QuickEdit.vue'
+import LinkEditor from './LinkEditor.vue'
+import { textRuns, localDelta } from '../core/textEdit.js'
+import { shiftAnnotation } from '../core/links.js'
 
 const pageCount = computed(() => store.pageCount)
 const page = computed(() => { store.rev; return listPages(ctx())[store.currentPage] })
@@ -26,8 +30,8 @@ const analysis = computed(() => {
   const a = analyzePage(ctx(), p.dict)
   const tree = buildTree(a.ops)
   // stable ids = index paths
-  const assign = (n, id) => { n.id = id; if (n.children) n.children.forEach((c, i) => assign(c, id ? `${id}.${i}` : String(i))) }
-  assign(tree, '')
+  const assign = (n, id, ptypes) => { n.id = id; n.ptypes = ptypes; if (n.children) n.children.forEach((c, i) => assign(c, id ? `${id}.${i}` : String(i), id === '' ? [] : [...ptypes, n.type])) }
+  assign(tree, '', [])
   tree.id = 'root'
   return { ...a, tree }
 })
@@ -196,30 +200,6 @@ function focusOp(i) {
   locate(store.currentPage, opFocusBox(boxes.value, i))
 }
 
-// click in preview → select the smallest element containing the point
-watch(() => store.pick, async (p) => {
-  if (!p || p.page !== store.currentPage || store.tab !== 'elements' || !analysis.value) return
-  let best = null, bestArea = Infinity, bestPath = []
-  const visit = (n, path) => {
-    if (n.id !== 'root') {
-      const b = nodeBox(n, boxes.value)
-      if (b && p.x >= b[0] - 2 && p.x <= b[2] + 2 && p.y >= b[1] - 2 && p.y <= b[3] + 2) {
-        const area = Math.max(1, (b[2] - b[0]) * (b[3] - b[1]))
-        if (area <= bestArea) { best = n; bestArea = area; bestPath = path }
-      }
-    }
-    if (n.children) n.children.forEach((c) => visit(c, [...path, n.id]))
-  }
-  visit(analysis.value.tree, [])
-  if (!best) return
-  const ex = new Set(expanded.value)
-  bestPath.forEach((id) => ex.add(id))
-  expanded.value = ex
-  sel.value = new Set([best.id])
-  focusNode(best)
-  await nextTick()
-  document.querySelector(`[data-node="${best.id}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
-})
 
 /* ---------- rebuilding ---------- */
 function emitNode(node, transform, out) {
@@ -238,6 +218,62 @@ function rebuild(label, transform) {
   emitNode(analysis.value.tree, transform, out)
   mutate(label, (c) => writePageOps(c, listPages(c)[store.currentPage].dict, out))
 }
+/* ---------- quick edit: text & move ---------- */
+const selNodes = computed(() => {
+  const s = effectiveSel()
+  const out = []
+  if (analysis.value && s.size) walkTree(analysis.value.tree, (n) => { if (s.has(n.id)) out.push(n) })
+  return out
+})
+const quickRuns = computed(() => {
+  const det = boxes.value.details || []
+  const runs = []
+  for (const n of selNodes.value) {
+    runs.push(...textRuns(ops.value, det, n.from, n.to, opEnv.font))
+    if (runs.length > 30) break
+  }
+  return runs.slice(0, 30)
+})
+const MOVABLE = new Set(['group', 'text', 'marked', 'compat', 'path', 'xobject', 'inline', 'shading'])
+const moveInfo = computed(() => {
+  const nodes = selNodes.value
+  if (!nodes.length) return { ok: false, reason: 'Select an element to move it' }
+  const inText = nodes.find((n) => n.ptypes.includes('text'))
+  if (inText) return { ok: false, reason: 'Parts inside a text object (BT…ET) cannot be moved separately – select the whole text element (or its group) instead. You can also edit the Td / Tm operands.' }
+  const bad = nodes.find((n) => !MOVABLE.has(n.type))
+  if (bad) return { ok: false, reason: `“${bad.type === 'op' ? 'single operator' : bad.type}” has nothing to move – select a drawing, text, image or group` }
+  let box = null
+  for (const n of nodes) { const b = nodeBox(n, boxes.value); if (b) box = box ? [Math.min(box[0], b[0]), Math.min(box[1], b[1]), Math.max(box[2], b[2]), Math.max(box[3], b[3])] : b }
+  return { ok: true, label: `${nodes.length} element(s)`, box }
+})
+function applyRunText(i, newOp) {
+  replaceOp(i, [newOp])
+}
+function focusRun(r) { locate(store.currentPage, opFocusBox(boxes.value, r.index)) }
+
+const isTranslation = (o) => o && o.op === 'cm' && o.args.length === 6 && ['1', '0', '0', '1'].every((v, k) => parseFloat(o.args[k].v) === +v)
+const numTok = (v) => ({ t: 'num', v: String(Math.round(v * 10000) / 10000) })
+/** Move selected elements by (dx, dy) page points: wrap in q [translate] cm … Q, or update an existing translation. */
+function actTranslate(dxPage, dyPage) {
+  if (!moveInfo.value.ok || (!dxPage && !dyPage)) return
+  const s = effectiveSel()
+  const det = boxes.value.details || []
+  rebuild(`Move element(s) by ${dxPage}, ${dyPage}`, (parent, kids) => kids.map((k) => {
+    if (!s.has(k.id)) return k
+    const seg = []
+    emitNode(k, null, seg)
+    const [lx, ly] = localDelta(det[k.from]?.ctm, dxPage, dyPage)
+    if (k.type === 'group' && isTranslation(seg[1])) {
+      const cm = { op: 'cm', args: seg[1].args.slice() }
+      cm.args[4] = numTok(parseFloat(cm.args[4].v) + lx)
+      cm.args[5] = numTok(parseFloat(cm.args[5].v) + ly)
+      return { raw: [seg[0], cm, ...seg.slice(2)] }
+    }
+    return { raw: [{ op: 'q', args: [] }, { op: 'cm', args: [numTok(1), numTok(0), numTok(0), numTok(1), numTok(lx), numTok(ly)] }, ...seg, { op: 'Q', args: [] }] }
+  }))
+}
+
+
 function effectiveSel() {
   // drop nodes whose ancestor is also selected
   const ids = [...sel.value]
@@ -373,6 +409,21 @@ const annots = computed(() => {
   })
 })
 const annSel = ref(new Set())
+const linkOpen = ref(new Set())
+const linkFocus = ref(-1)
+function toggleLink(i) { const s = new Set(linkOpen.value); s.has(i) ? s.delete(i) : s.add(i); linkOpen.value = s }
+const annSelRect = computed(() => {
+  let box = null
+  for (const a of annots.value) if (annSel.value.has(a.i) && a.rect) box = box ? [Math.min(box[0], a.rect[0]), Math.min(box[1], a.rect[1]), Math.max(box[2], a.rect[2]), Math.max(box[3], a.rect[3])] : a.rect.slice()
+  return box
+})
+function annShift(dxp, dyp) {
+  const s = [...annSel.value]
+  if (!s.length || (!dxp && !dyp)) return
+  withAnnots(`Move ${s.length} annotation(s)`, (c, a) => {
+    for (const i of s) { const d = deref(c, a.get(i)); if (d instanceof PDFDict) shiftAnnotation(c, d, dxp, dyp) }
+  })
+}
 const annOpen = ref(new Set())
 function annToggleSel(i) { const s = new Set(annSel.value); s.has(i) ? s.delete(i) : s.add(i); annSel.value = s }
 function annToggleOpen(i) { const s = new Set(annOpen.value); s.has(i) ? s.delete(i) : s.add(i); annOpen.value = s }
@@ -494,6 +545,65 @@ async function exportFont(f) {
 const glyphFont = ref(null)
 const objOpen = ref(new Set())
 function toggleObj(key) { const s = new Set(objOpen.value); s.has(key) ? s.delete(key) : s.add(key); objOpen.value = s }
+
+// click in preview → select the smallest element containing the point
+watch(() => store.pick, async (p) => {
+  if (!p || p.page !== store.currentPage || store.tab !== 'elements' || !analysis.value) return
+  let best = null, bestArea = Infinity, bestPath = []
+  const visit = (n, path) => {
+    if (n.id !== 'root') {
+      const b = nodeBox(n, boxes.value)
+      if (b && p.x >= b[0] - 2 && p.x <= b[2] + 2 && p.y >= b[1] - 2 && p.y <= b[3] + 2) {
+        const area = Math.max(1, (b[2] - b[0]) * (b[3] - b[1]))
+        if (area <= bestArea) { best = n; bestArea = area; bestPath = path }
+      }
+    }
+    if (n.children) n.children.forEach((c) => visit(c, [...path, n.id]))
+  }
+  visit(analysis.value.tree, [])
+  // links: a click inside a link rectangle opens its target editor
+  const link = annots.value.find((a) => a.subtype === 'Link' && a.rect && p.x >= a.rect[0] && p.x <= a.rect[2] && p.y >= a.rect[1] && p.y <= a.rect[3])
+  const bestHasText = best && textRuns(ops.value, boxes.value.details || [], best.from, best.to, opEnv.font).length > 0
+  if (link) {
+    annSel.value = new Set([link.i])
+    linkOpen.value = new Set([...linkOpen.value, link.i])
+    linkFocus.value = p.edit && !bestHasText ? link.i : -1
+    if (p.edit && !bestHasText) {
+      await nextTick()
+      document.querySelector(`[data-annot="${link.i}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      return
+    }
+  }
+  if (!best) return
+  const ex = new Set(expanded.value)
+  bestPath.forEach((id) => ex.add(id))
+  expanded.value = ex
+  sel.value = new Set([best.id])
+  focusNode(best)
+  await nextTick()
+  if (p.edit && quickRuns.value.length) {
+    const el = document.querySelector('[data-quick-text="0"]')
+    el?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    el?.focus()
+    el?.select()
+    return
+  }
+  document.querySelector(`[data-node="${best.id}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+}, { immediate: true })
+
+// let the preview show a draggable box for the selection
+watch([moveInfo, () => store.tab, annSelRect], () => {
+  if (store.tab !== 'elements') { store.moveTarget = null; return }
+  if (moveInfo.value.ok && moveInfo.value.box) store.moveTarget = { page: store.currentPage, rect: moveInfo.value.box, kind: 'content' }
+  else if (annSelRect.value) store.moveTarget = { page: store.currentPage, rect: annSelRect.value, kind: 'annot' }
+  else store.moveTarget = null
+})
+watch(() => store.moveRequest, (r) => {
+  if (!r || r.page !== store.currentPage) return
+  if (r.kind === 'annot') annShift(r.dx, r.dy)
+  else actTranslate(r.dx, r.dy)
+})
+onBeforeUnmount(() => { store.moveTarget = null })
 </script>
 
 <template>
@@ -538,7 +648,9 @@ function toggleObj(key) { const s = new Set(objOpen.value); s.has(key) ? s.delet
       </div>
     </div>
 
-    <div class="section-title">Content <span class="font-normal normal-case text-zinc-500">· click an element in the preview to find it</span></div>
+    <QuickEdit v-if="sel.size" :runs="quickRuns" :move="moveInfo" :rev="store.rev" @apply-text="applyRunText" @move="actTranslate" @focus-run="focusRun" />
+
+    <div class="section-title">Content <span class="font-normal normal-case text-zinc-500">· click an element in the preview to find it · double-click text to edit it</span></div>
     <div class="rounded-md border border-zinc-800 bg-zinc-900/60 py-1">
       <ElementNode
         v-for="n in analysis.tree.children.slice(0, 500)" :key="n.id"
@@ -555,20 +667,29 @@ function toggleObj(key) { const s = new Set(objOpen.value); s.has(key) ? s.delet
       <div class="flex flex-wrap items-center gap-1 border-b border-zinc-800 p-1">
         <span class="text-[11px]" :class="annSel.size ? 'text-cyan-300' : 'text-zinc-500'">{{ annSel.size ? `${annSel.size} selected` : 'Select annotations' }}</span>
         <div class="flex-1" />
-        <button class="btn" :disabled="!annSel.size" @click="annMove(-1)">▲</button>
+        <template v-if="annSel.size">
+          <button class="btn btn-icon" v-tip="'Move left 1pt (Shift = 10pt)'" @click="annShift($event.shiftKey ? -10 : -1, 0)">←</button>
+          <button class="btn btn-icon" v-tip="'Move right'" @click="annShift($event.shiftKey ? 10 : 1, 0)">→</button>
+          <button class="btn btn-icon" v-tip="'Move up'" @click="annShift(0, $event.shiftKey ? 10 : 1)">↑</button>
+          <button class="btn btn-icon" v-tip="'Move down'" @click="annShift(0, $event.shiftKey ? -10 : -1)">↓</button>
+          <span class="mx-0.5 h-4 w-px bg-zinc-700" />
+        </template>
+        <button class="btn" :disabled="!annSel.size" v-tip="'Earlier in /Annots (drawn below)'" @click="annMove(-1)">▲</button>
         <button class="btn" :disabled="!annSel.size" @click="annMove(1)">▼</button>
         <button class="btn" :disabled="!annSel.size" v-tip="'Duplicate as new annotation objects (uses dx/dy offset from the toolbar)'" @click="annDuplicate">Duplicate</button>
         <button class="btn btn-danger" :disabled="!annSel.size" @click="annDelete">Delete</button>
       </div>
-      <div v-for="a in annots" :key="a.i + ':' + (a.ref?.objectNumber ?? 'd')" class="border-b border-zinc-800/60 last:border-0">
-        <div class="flex items-center gap-1.5 px-1 py-1 text-xs hover:bg-zinc-700/30" :class="{ 'row-sel': annSel.has(a.i) }" tabindex="0" @focus="annFocus(a)" @click="annFocus(a)">
+      <div v-for="a in annots" :key="a.i + ':' + (a.ref?.objectNumber ?? 'd')" :data-annot="a.i" class="border-b border-zinc-800/60 last:border-0">
+        <div class="flex items-center gap-1.5 px-1 py-1 text-xs hover:bg-zinc-700/30" :class="{ 'row-sel': annSel.has(a.i) }" tabindex="0" @focus="annFocus(a)" @click="annFocus(a); annSel = new Set([a.i])">
           <input type="checkbox" :checked="annSel.has(a.i)" @click.stop="annToggleSel(a.i)" />
           <button class="w-4 text-zinc-500" @click.stop="annToggleOpen(a.i)">{{ annOpen.has(a.i) ? '▾' : '▸' }}</button>
           <span class="tag bg-yellow-900/60 text-yellow-200">{{ a.subtype }}</span>
           <span class="min-w-0 flex-1 truncate text-zinc-300" dir="auto">{{ a.text }}</span>
           <span class="font-mono text-[10px] text-zinc-500">{{ a.rect ? a.rect.map((v) => Math.round(v)).join(' ') : '' }}</span>
+          <button v-if="a.subtype === 'Link' && a.ref" class="btn btn-icon text-[10px]" :class="{ 'border-sky-500 text-sky-200': linkOpen.has(a.i) }" v-tip="'Edit where this link goes'" @click.stop="toggleLink(a.i)">🔗 target</button>
           <span class="font-mono text-[10px] text-violet-300/70">{{ a.ref ? a.ref.objectNumber + ' 0 R' : 'direct' }}</span>
         </div>
+        <LinkEditor v-if="linkOpen.has(a.i) && a.ref" :annot-ref="a.ref" :autofocus="linkFocus === a.i" />
         <div v-if="annOpen.has(a.i) && a.ref" class="pb-1">
           <ObjectNode :owner="a.ref" :path="[]" start-open :removable="false" :depth="1" />
         </div>

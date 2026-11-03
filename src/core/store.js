@@ -39,6 +39,8 @@ export const store = reactive({
   dirty: false,
   mobileView: 'editor',
   objectFocus: null, // ref tag to reveal in objects tab
+  moveTarget: null, // { page, rect, kind } – selection the preview can drag
+  moveRequest: null, // { page, dx, dy, kind, n } – drag result from the preview
 })
 
 let locIndex = null

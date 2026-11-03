@@ -20,6 +20,20 @@ Cloudflare Pages.
 | **Signatures** | Signed documents show a warning; exports are written without the signature (signature values, `/Perms`, `/DSS` removed; empty fields kept). |
 | **Other** | Undo/redo (Ctrl+Z / Ctrl+Shift+Z), drafts saved in the browser (IndexedDB), hover explanations for keys and operators, focus-to-locate animation in the preview, responsive layout. |
 
+### Quick editing
+
+* **Text**: double-click text in the preview (or select a text element) and a quick-edit field with the readable
+  text opens and is focused. Enter applies; the text is encoded through the font, with feedback for characters
+  the (subset) font lacks. In `TJ` arrays kerning is kept when the number of characters is unchanged.
+* **Move**: selected drawings, images, text objects and groups can be moved with arrow buttons / keys (Shift = ×10),
+  exact dx/dy, or by dragging the dashed selection box in the preview. The move is written as
+  `q 1 0 0 1 dx dy cm … Q` (an existing translation wrapper is updated instead of nesting), converted into the
+  element's local coordinate system so the distance is exact in page points. Parts inside a `BT…ET` text object
+  cannot be moved on their own (the whole text object can). Annotations move by shifting `Rect`, `QuadPoints`,
+  `Vertices`, `InkList`, `L` and their popup.
+* **Links**: clicking a link in the preview opens its target editor: URL (`/A << /S /URI >>`), a page of this
+  document with a fit mode (`/Dest [page /Fit|/XYZ …]`), or a named destination (with suggestions from the catalog).
+
 ### Editing content streams
 
 * Every operation line shows **operand chips** with a tooltip explaining what that operand does *in this line*

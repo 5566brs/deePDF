@@ -416,6 +416,7 @@ export function computeBoxes(ops, env = {}, baseCtm = IDENTITY) {
   for (let i = 0; i < ops.length; i++) {
     const { op, args } = ops[i]
     const n = (k) => num(args[k])
+    details[i].ctm = ctm
     if (op === 'BMC' || op === 'BDC') marked.push(args[0]?.v)
     else if (op === 'EMC') marked.pop()
     if (TEXT_SHOW.has(op) && marked.includes('ReversedChars')) details[i].reversed = true
