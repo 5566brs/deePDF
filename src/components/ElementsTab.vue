@@ -1,9 +1,10 @@
 <script setup>
 // Elements of the current page: content-stream element tree, annotations and resources.
-import { computed, ref, watch, nextTick, onBeforeUnmount } from 'vue'
+import { computed, ref, watch, nextTick, onBeforeUnmount, provide } from 'vue'
 import { store, ctx, mutate, locate, locateRef, notify, download, baseName } from '../core/store.js'
-import { listPages, analyzePage, writePageOps, writePageContent, inherited, makeEnv, normRect } from '../core/pages.js'
-import { buildTree, walkTree, nodeBox, opToString, opToDisplay, tokBytes, guessText, tokToString, TEXT_SHOW, parseContent } from '../core/contentStream.js'
+import { listPages, analyzePage, writePageOps, writePageContent, inherited, makeEnv, normRect, fontDictByName } from '../core/pages.js'
+import { fontInfo, decodeText } from '../core/fonts.js'
+import { buildTree, walkTree, nodeBox, opFocusBox, opToString, opToDisplay, tokBytes, guessText, tokToString, TEXT_SHOW, parseContent } from '../core/contentStream.js'
 import {
   N, deref, nameStr, numArray, numVal, PDFArray, PDFDict, PDFRef, PDFStream, PDFNumber, cloneObj, stringText,
   fmtBytes, fmtNum, latin1, fromLatin1,
@@ -12,6 +13,7 @@ import { imageInfo, imageBlob, fontFileOf, isImageXObject } from '../core/images
 import { decodeStream } from '../core/pdfobj.js'
 import ElementNode from './ElementNode.vue'
 import ObjectNode from './ObjectNode.vue'
+import GlyphDialog from './GlyphDialog.vue'
 
 const pageCount = computed(() => store.pageCount)
 const page = computed(() => { store.rev; return listPages(ctx())[store.currentPage] })
@@ -33,9 +35,33 @@ const ops = computed(() => analysis.value?.ops || [])
 const boxes = computed(() => analysis.value?.boxes || [])
 const resources = computed(() => { store.rev; return page.value ? inherited(ctx(), page.value.dict, 'Resources') : null })
 
+const opEnv = makeOpEnv(() => boxes.value, () => resources.value, (box) => locate(store.currentPage, box))
+provide('opEnv', opEnv)
+
 const sel = ref(new Set())
 const expanded = ref(new Set())
 watch(() => store.currentPage, () => { sel.value = new Set(); expanded.value = new Set(); annSel.value = new Set() })
+
+/* ---------- op environment for line editors ---------- */
+function makeOpEnv(getBoxes, getRes, loc) {
+  return {
+    boxes: getBoxes,
+    locate: loc,
+    font: (name) => { const f = fontDictByName(ctx(), getRes(), name); return f ? fontInfo(ctx(), f) : null },
+    fontLabel: (name) => {
+      const f = fontDictByName(ctx(), getRes(), name)
+      if (!f) return 'Font resource not found'
+      const i = fontInfo(ctx(), f)
+      return `→ ${i.baseFont || '(no BaseFont)'} · ${i.type}${i.composite ? ' (composite, multi-byte codes)' : ''} · ${i.embedded ? 'embedded' : 'not embedded'}${i.hasToUnicode ? ' · has ToUnicode' : ' · no ToUnicode'}`
+    },
+    xobject: (name) => {
+      const x = resXObject(name)
+      if (!x) return 'XObject resource not found'
+      if (isImageXObject(ctx(), x.obj)) { const inf = imageInfo(ctx(), x.obj); return `→ Image ${inf.width}×${inf.height} ${inf.colorSpace} ${inf.filters.join(',')} (object ${x.ref?.objectNumber})` }
+      return `→ Form XObject (object ${x.ref?.objectNumber})`
+    },
+  }
+}
 
 /* ---------- labels ---------- */
 const thumbCache = new Map()
@@ -64,19 +90,27 @@ function fontIsTwoByte(fontName) {
 
 function textOf(node) {
   let font = null, size = null, s = ''
+  const det = boxes.value.details || []
   for (let i = node.from; i <= node.to; i++) {
     const o = ops.value[i]
-    if (o.op === 'Tf') { font = o.args[0]?.v; size = o.args[1]?.v }
     if (!TEXT_SHOW.has(o.op)) continue
-    const two = font ? fontIsTwoByte(font) : false
+    const d = det[i] || {}
+    font = d.font || font; size = d.size || size
+    const fi = d.font ? opEnv.font(d.font) : null
+    const dec = (tok) => {
+      const t = fi ? decodeText(fi, tokBytes(tok)) : guessText(tokBytes(tok), false)
+      return d.reversed ? [...t].reverse().join('') : t
+    }
     const arg = o.op === 'TJ' ? o.args[0] : o.args[o.args.length - 1]
     if (!arg) continue
+    let part = ''
     if (arg.t === 'arr') {
       for (const el of arg.v) {
-        if (el.t === 'str' || el.t === 'hex') s += guessText(tokBytes(el), two)
-        else if (el.t === 'num' && parseFloat(el.v) < -200) s += ' '
+        if (el.t === 'str' || el.t === 'hex') part += dec(el)
+        else if (el.t === 'num' && parseFloat(el.v) < -200) part += ' '
       }
-    } else s += guessText(tokBytes(arg), two)
+    } else part = dec(arg)
+    s = d.reversed ? part + s : s + part
     if (o.op === "'" || o.op === '"') s += ' '
     if (s.length > 200) break
   }
@@ -155,10 +189,11 @@ function toggle(node) {
   expanded.value = s
 }
 function focusNode(node) {
-  locate(store.currentPage, nodeBox(node, boxes.value))
+  const b = node.type === 'op' ? opFocusBox(boxes.value, node.from) : nodeBox(node, boxes.value)
+  locate(store.currentPage, b)
 }
 function focusOp(i) {
-  locate(store.currentPage, boxes.value[i])
+  locate(store.currentPage, opFocusBox(boxes.value, i))
 }
 
 // click in preview → select the smallest element containing the point
@@ -439,6 +474,7 @@ const fonts = computed(() => {
       base: nameStr(deref(c, f.get(N('BaseFont')))) || '',
       subtype: nameStr(deref(c, f.get(N('Subtype')))) || '',
       file: fontFileOf(c, f),
+      info: fontInfo(c, f),
     }
   })
 })
@@ -455,6 +491,7 @@ function exportFont(f) {
   const d = decodeStream(ctx(), f.file.stream)
   download(d.bytes, `${baseName()}-${(f.base || f.name).replace(/[^\w.+-]/g, '_')}.${f.file.ext}`)
 }
+const glyphFont = ref(null)
 const objOpen = ref(new Set())
 function toggleObj(key) { const s = new Set(objOpen.value); s.has(key) ? s.delete(key) : s.add(key); objOpen.value = s }
 </script>
@@ -575,6 +612,7 @@ function toggleObj(key) { const s = new Set(objOpen.value); s.has(key) ? s.delet
           <span class="min-w-0 flex-1 truncate text-zinc-400">{{ f.base }} <span class="text-zinc-600">{{ f.subtype }}</span></span>
           <span v-if="f.file" class="tag bg-emerald-900/60 text-emerald-300">embedded</span>
           <span v-else class="tag bg-zinc-800 text-zinc-500">not embedded</span>
+          <button class="btn" v-tip="'Show the glyphs of this font: export outlines as SVG, copy codes'" @click="glyphFont = f">Glyphs</button>
           <button v-if="f.file" class="btn" v-tip="`Export the embedded font program (${f.file.label}) as .${f.file.ext}`" @click="exportFont(f)">Export</button>
         </div>
         <div v-if="objOpen.has('f' + f.name) && f.ref instanceof PDFRef" class="pb-1">
@@ -583,6 +621,7 @@ function toggleObj(key) { const s = new Set(objOpen.value); s.has(key) ? s.delet
       </div>
     </div>
     <div v-else class="text-xs text-zinc-500">No fonts.</div>
+    <GlyphDialog v-if="glyphFont" :page-index="store.currentPage" :font="glyphFont" @close="glyphFont = null" />
   </div>
   <div v-else class="p-4 text-sm text-zinc-500">No page selected.</div>
 </template>

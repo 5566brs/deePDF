@@ -4,6 +4,7 @@ import {
   N, deref, nameStr, numArray, numVal, cloneObj, decodeStream, setStreamData, concatBytes, filtersOf,
 } from './pdfobj.js'
 import { parseContent, serializeOps, computeBoxes, IDENTITY } from './contentStream.js'
+import { fontInfo } from './fonts.js'
 
 export const INHERITABLE = ['Resources', 'MediaBox', 'CropBox', 'Rotate']
 export const BOX_KEYS = ['MediaBox', 'CropBox', 'BleedBox', 'TrimBox', 'ArtBox']
@@ -172,41 +173,10 @@ export function resourcesOf(ctx, dictLike) {
   return deref(ctx, dictLike.get(N('Resources')))
 }
 
-function fontWidths(ctx, fontDict) {
-  const subtype = nameStr(deref(ctx, fontDict.get(N('Subtype'))))
-  if (subtype === 'Type0') {
-    const desc = deref(ctx, fontDict.get(N('DescendantFonts')))
-    const cid = desc instanceof PDFArray ? deref(ctx, desc.get(0)) : null
-    const dw = cid instanceof PDFDict ? numVal(deref(ctx, cid.get(N('DW')))) ?? 1000 : 1000
-    const map = new Map()
-    const W = cid instanceof PDFDict ? deref(ctx, cid.get(N('W'))) : null
-    if (W instanceof PDFArray) {
-      const a = W.asArray().map((x) => deref(ctx, x))
-      for (let k = 0; k < a.length;) {
-        const first = numVal(a[k])
-        if (a[k + 1] instanceof PDFArray) {
-          a[k + 1].asArray().forEach((w, j) => map.set(first + j, numVal(deref(ctx, w)) ?? dw))
-          k += 2
-        } else {
-          const last = numVal(a[k + 1]), w = numVal(a[k + 2])
-          if (last - first < 70000) for (let c = first; c <= last; c++) map.set(c, w)
-          k += 3
-        }
-      }
-    }
-    return { twoByte: true, widthOf: (c) => map.get(c) ?? dw }
-  }
-  if (subtype === 'Type3') return { twoByte: false, widthOf: () => 500 }
-  const fc = numVal(deref(ctx, fontDict.get(N('FirstChar')))) ?? 0
-  const widths = numArray(ctx, fontDict.get(N('Widths')))
-  const desc = deref(ctx, fontDict.get(N('FontDescriptor')))
-  const missing = desc instanceof PDFDict ? numVal(deref(ctx, desc.get(N('MissingWidth')))) : undefined
-  const base = nameStr(deref(ctx, fontDict.get(N('BaseFont')))) || ''
-  const mono = /Courier/i.test(base)
-  return {
-    twoByte: false,
-    widthOf: (c) => (widths && widths[c - fc] !== undefined ? widths[c - fc] : missing ?? (mono ? 600 : 520)),
-  }
+export function fontDictByName(ctx, resources, name) {
+  const fonts = resources instanceof PDFDict ? deref(ctx, resources.get(N('Font'))) : null
+  const f = fonts instanceof PDFDict ? deref(ctx, fonts.get(N(name))) : null
+  return f instanceof PDFDict ? f : null
 }
 
 export function makeEnv(ctx, resources) {
@@ -215,7 +185,7 @@ export function makeEnv(ctx, resources) {
   return {
     resolveFont(name) {
       const f = fonts instanceof PDFDict ? deref(ctx, fonts.get(N(name))) : null
-      return f instanceof PDFDict ? fontWidths(ctx, f) : null
+      return f instanceof PDFDict ? fontInfo(ctx, f) : null
     },
     resolveXObject(name) {
       const x = xobjs instanceof PDFDict ? deref(ctx, xobjs.get(N(name))) : null

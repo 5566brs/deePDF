@@ -341,83 +341,181 @@ export function unionBox(a, b) {
 }
 const num = (t) => (t && t.t === 'num' ? parseFloat(t.v) : 0)
 
+const FILL_SET = new Set(['rg', 'g', 'k', 'sc', 'scn', 'cs'])
+const STROKE_SET = new Set(['RG', 'G', 'K', 'SC', 'SCN', 'CS'])
+const LINE_SET = new Set(['w', 'J', 'j', 'M', 'd'])
+const TEXT_SET = new Set(['Tf', 'Tc', 'Tw', 'Tz', 'TL', 'Ts', 'Tr'])
+const POS_SET = new Set(['Td', 'TD', 'Tm', 'T*'])
+const FILL_PAINT = new Set(['f', 'F', 'f*', 'B', 'B*', 'b', 'b*'])
+const STROKE_PAINT = new Set(['S', 's', 'B', 'B*', 'b', 'b*'])
+
 /**
- * Compute an approximate user-space bounding box for every op.
- * env: { resolveFont(name) => {widthOf(code), twoByte} | null, resolveXObject(name) => {subtype, bbox, matrix} | null }
+ * Interpret operations and compute user-space geometry.
+ * Returns `boxes` (one per op: what the op itself draws) with `boxes.details[i]`:
+ *   { args: { 'a0': box, 'a0.3': box … },   // per operand (and per array element)
+ *     glyphs: [{ tok, start, end, code, uni, box }],   // per glyph of shown strings
+ *     influence: box }   // everything painted under the state this op sets (colours, cm, Tf …)
+ * env: { resolveFont(name) => fontInfo|null, resolveXObject(name) => {subtype, bbox, matrix}|null }
  */
 export function computeBoxes(ops, env = {}, baseCtm = IDENTITY) {
   const boxes = new Array(ops.length).fill(null)
+  const details = ops.map(() => ({ args: {}, glyphs: [], influence: null }))
+  boxes.details = details
   const gsStack = []
   let ctm = baseCtm.slice()
   let ts = { font: null, size: 12, Tc: 0, Tw: 0, Th: 1, TL: 0, rise: 0 }
+  let setters = { fill: -1, stroke: -1, line: [], gs: -1, text: [], cms: [] }
+  let pos = []
   let Tm = IDENTITY.slice(), Tlm = IDENTITY.slice()
   let path = [], pathOps = []
-  let fontCache = new Map()
+  const marked = [] // marked-content tags stack
+  const fontCache = new Map()
   const font = () => {
     if (!ts.font) return null
     if (!fontCache.has(ts.font)) fontCache.set(ts.font, env.resolveFont ? env.resolveFont(ts.font) : null)
     return fontCache.get(ts.font)
   }
+  const addInfl = (idx, box) => { if (idx >= 0 && box) details[idx].influence = unionBox(details[idx].influence, box) }
+  const painted = (box, { fill = false, stroke = false, text = false } = {}) => {
+    if (!box) return
+    if (fill || text) addInfl(setters.fill, box)
+    if (stroke) { addInfl(setters.stroke, box); for (const k of setters.line) addInfl(k, box) }
+    addInfl(setters.gs, box)
+    for (const k of setters.cms) addInfl(k, box)
+    if (text) { for (const k of setters.text) addInfl(k, box); for (const k of pos) addInfl(k, box) }
+  }
+  const setArg = (i, key, box) => { if (box) details[i].args[key] = unionBox(details[i].args[key], box) }
+  const pointBox = (m, x, y) => { const [px, py] = apply(m, x, y); return [px, py, px, py] }
 
-  const showString = (i, bytes) => {
+  const showString = (i, tok, tokKey) => {
+    const bytes = tokBytes(tok)
     const f = font()
-    const twoByte = f ? f.twoByte : false
     const fs = ts.size
-    let w = 0
-    const step = twoByte ? 2 : 1
-    for (let k = 0; k + step - 1 < bytes.length; k += step) {
-      const code = twoByte ? (bytes[k] << 8) | bytes[k + 1] : bytes[k]
-      const gw = f ? f.widthOf(code) : 500
-      w += (gw / 1000) * fs + ts.Tc + (!twoByte && code === 32 ? ts.Tw : 0)
+    const trmBase = mul([fs * ts.Th, 0, 0, fs, 0, ts.rise], mul(Tm, ctm))
+    const asc = (f ? f.ascent : 800) / 1000, desc = (f ? f.descent : -200) / 1000
+    let total = null
+    for (let k = 0; k < bytes.length;) {
+      const len = f ? f.codeLen(bytes, k) : 1
+      let code = 0
+      for (let q = 0; q < len; q++) code = (code << 8) | (bytes[k + q] ?? 0)
+      const w0 = (f ? f.widthOf(code) : 500) / 1000
+      const trm = mul([fs * ts.Th, 0, 0, fs, 0, ts.rise], mul(Tm, ctm))
+      const box = bboxOfPoints(rectPts(trm, 0, desc, w0, asc))
+      details[i].glyphs.push({ tok: tokKey, start: k, end: k + len, code, uni: f ? f.toUnicode(code) : String.fromCharCode(code), box })
+      total = unionBox(total, box)
+      const tx = (w0 * fs + ts.Tc + (len === 1 && code === 32 ? ts.Tw : 0)) * ts.Th
+      Tm = mul([1, 0, 0, 1, tx, 0], Tm)
+      k += len
     }
-    w *= ts.Th
-    const trm = mul(Tm, ctm)
-    const lo = -0.22 * Math.abs(fs) + ts.rise, hi = 0.88 * Math.abs(fs) + ts.rise
-    const box = bboxOfPoints(rectPts(trm, 0, lo, w, hi))
-    boxes[i] = unionBox(boxes[i], box)
-    Tm = mul([1, 0, 0, 1, w, 0], Tm)
+    if (!bytes.length) total = bboxOfPoints(rectPts(trmBase, 0, desc, 0.01, asc))
+    setArg(i, tokKey, total)
+    boxes[i] = unionBox(boxes[i], total)
+    return total
   }
 
   for (let i = 0; i < ops.length; i++) {
     const { op, args } = ops[i]
+    const n = (k) => num(args[k])
+    if (op === 'BMC' || op === 'BDC') marked.push(args[0]?.v)
+    else if (op === 'EMC') marked.pop()
+    if (TEXT_SHOW.has(op) && marked.includes('ReversedChars')) details[i].reversed = true
+    if (TEXT_SHOW.has(op) || op === 'Tf') { details[i].font = op === 'Tf' ? args[0]?.v : ts.font; details[i].size = op === 'Tf' ? n(1) : ts.size; details[i].Th = ts.Th }
     switch (op) {
-      case 'q': gsStack.push({ ctm, ts: { ...ts } }); break
-      case 'Q': { const s = gsStack.pop(); if (s) { ctm = s.ctm; ts = s.ts } break }
-      case 'cm': if (args.length >= 6) ctm = mul(args.slice(0, 6).map(num), ctm); break
-      case 'BT': Tm = IDENTITY.slice(); Tlm = IDENTITY.slice(); break
-      case 'Tf': ts.font = args[0] && args[0].t === 'name' ? args[0].v : null; ts.size = num(args[1]); break
-      case 'Tc': ts.Tc = num(args[0]); break
-      case 'Tw': ts.Tw = num(args[0]); break
-      case 'Tz': ts.Th = num(args[0]) / 100; break
-      case 'TL': ts.TL = num(args[0]); break
-      case 'Ts': ts.rise = num(args[0]); break
-      case 'Td': Tlm = mul([1, 0, 0, 1, num(args[0]), num(args[1])], Tlm); Tm = Tlm.slice(); break
-      case 'TD': ts.TL = -num(args[1]); Tlm = mul([1, 0, 0, 1, num(args[0]), num(args[1])], Tlm); Tm = Tlm.slice(); break
-      case 'Tm': Tlm = args.slice(0, 6).map(num); Tm = Tlm.slice(); break
-      case 'T*': Tlm = mul([1, 0, 0, 1, 0, -ts.TL], Tlm); Tm = Tlm.slice(); break
-      case 'Tj': if (args[0]) showString(i, tokBytes(args[0])); break
-      case "'": Tlm = mul([1, 0, 0, 1, 0, -ts.TL], Tlm); Tm = Tlm.slice(); if (args[0]) showString(i, tokBytes(args[0])); break
-      case '"': ts.Tw = num(args[0]); ts.Tc = num(args[1]); Tlm = mul([1, 0, 0, 1, 0, -ts.TL], Tlm); Tm = Tlm.slice(); if (args[2]) showString(i, tokBytes(args[2])); break
-      case 'TJ': {
-        const arr = args[0] && args[0].t === 'arr' ? args[0].v : []
-        for (const el of arr) {
-          if (el.t === 'num') Tm = mul([1, 0, 0, 1, (-parseFloat(el.v) / 1000) * ts.size * ts.Th, 0], Tm)
-          else if (el.t === 'str' || el.t === 'hex') showString(i, tokBytes(el))
+      case 'q': gsStack.push({ ctm, ts: { ...ts }, setters: { ...setters, line: setters.line.slice(), text: setters.text.slice(), cms: setters.cms.slice() } }); break
+      case 'Q': { const s = gsStack.pop(); if (s) { ctm = s.ctm; ts = s.ts; setters = s.setters } break }
+      case 'cm': {
+        if (args.length >= 6) {
+          ctm = mul(args.slice(0, 6).map(num), ctm)
+          const unit = bboxOfPoints(rectPts(ctm, 0, 0, 1, 1))
+          for (let k = 0; k < 4; k++) setArg(i, 'a' + k, unit)
+          setArg(i, 'a4', pointBox(ctm, 0, 0)); setArg(i, 'a5', pointBox(ctm, 0, 0))
+          setters.cms.push(i)
         }
         break
       }
-      case 'm': case 'l': path.push(apply(ctm, num(args[0]), num(args[1]))); pathOps.push(i); break
-      case 'c': for (let k = 0; k < 6; k += 2) path.push(apply(ctm, num(args[k]), num(args[k + 1]))); pathOps.push(i); break
-      case 'v': case 'y': for (let k = 0; k < 4; k += 2) path.push(apply(ctm, num(args[k]), num(args[k + 1]))); pathOps.push(i); break
+      case 'BT': Tm = IDENTITY.slice(); Tlm = IDENTITY.slice(); pos = []; break
+      case 'ET': pos = []; break
+      case 'Tf': ts.font = args[0] && args[0].t === 'name' ? args[0].v : null; ts.size = n(1); break
+      case 'Tc': ts.Tc = n(0); break
+      case 'Tw': ts.Tw = n(0); break
+      case 'Tz': ts.Th = n(0) / 100; break
+      case 'TL': ts.TL = n(0); break
+      case 'Ts': ts.rise = n(0); break
+      case 'Td': case 'TD': {
+        if (op === 'TD') ts.TL = -n(1)
+        const before = mul(Tlm, ctm)
+        Tlm = mul([1, 0, 0, 1, n(0), n(1)], Tlm); Tm = Tlm.slice()
+        const after = mul(Tlm, ctm)
+        const [x0, y0] = apply(before, 0, 0), [x1, y1] = apply(after, 0, 0)
+        setArg(i, 'a0', [Math.min(x0, x1), y1, Math.max(x0, x1), y1])
+        setArg(i, 'a1', [x1, Math.min(y0, y1), x1, Math.max(y0, y1)])
+        boxes[i] = pointBox(after, 0, 0)
+        break
+      }
+      case 'Tm': {
+        Tlm = args.slice(0, 6).map(num); Tm = Tlm.slice()
+        const m = mul(Tlm, ctm)
+        const em = bboxOfPoints(rectPts(mul([ts.size || 1, 0, 0, ts.size || 1, 0, 0], m), 0, 0, 1, 1))
+        for (let k = 0; k < 4; k++) setArg(i, 'a' + k, em)
+        setArg(i, 'a4', pointBox(m, 0, 0)); setArg(i, 'a5', pointBox(m, 0, 0))
+        boxes[i] = pointBox(m, 0, 0)
+        break
+      }
+      case 'T*': Tlm = mul([1, 0, 0, 1, 0, -ts.TL], Tlm); Tm = Tlm.slice(); boxes[i] = pointBox(mul(Tlm, ctm), 0, 0); break
+      case 'Tj': if (args[0]) painted(showString(i, args[0], 'a0'), { text: true }); break
+      case "'": Tlm = mul([1, 0, 0, 1, 0, -ts.TL], Tlm); Tm = Tlm.slice(); if (args[0]) painted(showString(i, args[0], 'a0'), { text: true }); break
+      case '"': ts.Tw = n(0); ts.Tc = n(1); Tlm = mul([1, 0, 0, 1, 0, -ts.TL], Tlm); Tm = Tlm.slice(); if (args[2]) painted(showString(i, args[2], 'a2'), { text: true }); break
+      case 'TJ': {
+        const arr = args[0] && args[0].t === 'arr' ? args[0].v : []
+        let all = null
+        arr.forEach((el, k) => {
+          const key = `a0.${k}`
+          if (el.t === 'num') {
+            const before = mul([ts.size * ts.Th, 0, 0, ts.size, 0, ts.rise], mul(Tm, ctm))
+            const tx = (-parseFloat(el.v) / 1000) * ts.size * ts.Th
+            Tm = mul([1, 0, 0, 1, tx, 0], Tm)
+            const f = font()
+            const asc = (f ? f.ascent : 800) / 1000, desc = (f ? f.descent : -200) / 1000
+            const gap = bboxOfPoints(rectPts(before, 0, desc, tx / (ts.size * ts.Th || 1), asc))
+            setArg(i, key, gap)
+          } else if (el.t === 'str' || el.t === 'hex') all = unionBox(all, showString(i, el, key))
+        })
+        setArg(i, 'a0', all)
+        painted(all, { text: true })
+        break
+      }
+      case 'm': case 'l': {
+        const p = apply(ctm, n(0), n(1))
+        path.push(p); pathOps.push(i)
+        setArg(i, 'a0', [p[0], p[1], p[0], p[1]]); setArg(i, 'a1', [p[0], p[1], p[0], p[1]])
+        break
+      }
+      case 'c': case 'v': case 'y': {
+        const cnt = op === 'c' ? 3 : 2
+        for (let k = 0; k < cnt; k++) {
+          const p = apply(ctm, n(k * 2), n(k * 2 + 1))
+          path.push(p)
+          setArg(i, 'a' + k * 2, [p[0], p[1], p[0], p[1]]); setArg(i, 'a' + (k * 2 + 1), [p[0], p[1], p[0], p[1]])
+        }
+        pathOps.push(i)
+        break
+      }
       case 're': {
-        const x = num(args[0]), y = num(args[1]), w = num(args[2]), h = num(args[3])
-        path.push(...rectPts(ctm, x, y, x + w, y + h)); pathOps.push(i); break
+        const x = n(0), y = n(1), w = n(2), h = n(3)
+        const pts = rectPts(ctm, x, y, x + w, y + h)
+        path.push(...pts); pathOps.push(i)
+        setArg(i, 'a0', pointBox(ctm, x, y)); setArg(i, 'a1', pointBox(ctm, x, y))
+        setArg(i, 'a2', bboxOfPoints([apply(ctm, x, y), apply(ctm, x + w, y)]))
+        setArg(i, 'a3', bboxOfPoints([apply(ctm, x, y), apply(ctm, x, y + h)]))
+        boxes[i] = bboxOfPoints(pts)
+        break
       }
       case 'h': case 'W': case 'W*': pathOps.push(i); break
       case 'S': case 's': case 'f': case 'F': case 'f*': case 'B': case 'B*': case 'b': case 'b*': case 'n': {
         const box = bboxOfPoints(path)
-        for (const k of pathOps) boxes[k] = box
+        for (const k of pathOps) if (!boxes[k] || ops[k].op !== 're') boxes[k] = box
         boxes[i] = box
+        painted(box, { fill: FILL_PAINT.has(op), stroke: STROKE_PAINT.has(op) })
         path = []; pathOps = []
         break
       }
@@ -429,13 +527,38 @@ export function computeBoxes(ops, env = {}, baseCtm = IDENTITY) {
           const b = xo.bbox || [0, 0, 1, 1]
           boxes[i] = bboxOfPoints(rectPts(m, b[0], b[1], b[2], b[3]))
         } else boxes[i] = bboxOfPoints(rectPts(ctm, 0, 0, 1, 1))
+        setArg(i, 'a0', boxes[i])
+        painted(boxes[i], { fill: true })
         break
       }
-      case 'BI': boxes[i] = bboxOfPoints(rectPts(ctm, 0, 0, 1, 1)); break
-      default: break
+      case 'BI': boxes[i] = bboxOfPoints(rectPts(ctm, 0, 0, 1, 1)); painted(boxes[i], { fill: true }); break
+      case 'sh': painted(null); break
+      default:
+        if (FILL_SET.has(op)) setters.fill = i
+        else if (STROKE_SET.has(op)) setters.stroke = i
+        else if (LINE_SET.has(op)) setters.line = [...setters.line.filter((k) => ops[k].op !== op), i]
+        else if (op === 'gs') setters.gs = i
+        break
     }
+    if (TEXT_SET.has(op)) setters.text = [...setters.text.filter((k) => ops[k].op !== op), i]
+    if (POS_SET.has(op)) pos = [i]
   }
   return boxes
+}
+
+/** Best box to highlight for operation i, optionally for a token key ('a0', 'a0.2') or a glyph. */
+export function opFocusBox(boxes, i, tokKey, byteOffset) {
+  const d = boxes.details ? boxes.details[i] : null
+  if (d && tokKey) {
+    if (byteOffset !== undefined) {
+      const g = d.glyphs.find((x) => x.tok === tokKey && byteOffset >= x.start && byteOffset < x.end)
+      if (g) return g.box
+    }
+    if (d.args[tokKey]) return d.args[tokKey]
+    const parent = tokKey.split('.')[0]
+    if (d.args[parent]) return d.args[parent]
+  }
+  return boxes[i] || (d && d.influence) || null
 }
 
 export function nodeBox(node, boxes) {

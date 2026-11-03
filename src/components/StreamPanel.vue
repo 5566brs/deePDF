@@ -1,13 +1,15 @@
 <script setup>
 // Stream data viewer/editor: decodes the stream, lets you edit it as operators, text or replace it, re-encodes on save.
-import { computed, ref, watch, onBeforeUnmount } from 'vue'
+import { computed, ref, watch, onBeforeUnmount, provide } from 'vue'
 import { store, ctx, mutate, locate, locationIndex, download, notify, baseName } from '../core/store.js'
 import {
   decodeStream, filtersOf, rawBytes, setStreamData, setStreamRaw, isTextLike, latin1, fromLatin1, toHex, fmtBytes,
   PDFStream, N, deref, nameStr,
 } from '../core/pdfobj.js'
 import { parseContent, serializeOps, computeBoxes } from '../core/contentStream.js'
-import { makeEnv, listPages } from '../core/pages.js'
+import { makeEnv, listPages, fontDictByName } from '../core/pages.js'
+import { fontInfo } from '../core/fonts.js'
+import { opDoc } from '../core/docs.js'
 import { imageBlob, isImageXObject } from '../core/images.js'
 import OpLine from './OpLine.vue'
 
@@ -61,6 +63,26 @@ const boxes = computed(() => {
   }
   try { return computeBoxes(ops.value, makeEnv(c, res)) } catch { return [] }
 })
+const streamRes = computed(() => {
+  store.rev
+  const c = ctx()
+  const s = stream.value
+  let res = s ? deref(c, s.dict.get(N('Resources'))) : null
+  const loc = info.value?.loc
+  if (!res && loc && loc.content) {
+    let node = listPages(c)[loc.page]?.dict
+    for (let d = 0; node && d < 32 && !res; d++) { res = deref(c, node.get(N('Resources'))); node = deref(c, node.get(N('Parent'))) }
+  }
+  return res
+})
+provide('opEnv', {
+  boxes: () => boxes.value,
+  locate: (box) => { const loc = info.value?.loc; if (loc) locate(loc.page, (loc.content && box) || loc.rect) },
+  font: (name) => { const f = fontDictByName(ctx(), streamRes.value, name); return f ? fontInfo(ctx(), f) : null },
+  fontLabel: (name) => { const f = fontDictByName(ctx(), streamRes.value, name); if (!f) return 'Font resource not found'; const i = fontInfo(ctx(), f); return `→ ${i.baseFont} · ${i.type}${i.embedded ? ' · embedded' : ''}` },
+  xobject: (name) => `XObject /${name}`,
+})
+void opDoc
 const opLimit = ref(400)
 const selectedOps = ref(new Set())
 

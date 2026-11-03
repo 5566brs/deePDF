@@ -27,6 +27,7 @@ export const store = reactive({
   undo: [],
   redo: [],
   previewBytes: null,
+  previewSource: null, // { transport, length } when the document is served from a Blob
   previewRev: 0,
   previewBusy: false,
   pick: null, // { page, x, y, n } click in preview
@@ -159,6 +160,7 @@ let previewSeq = 0
 export function bump() {
   store.rev++
   const c = ctx()
+  if (c) c.__rev = store.rev
   store.pageCount = c ? listPages(c).length : 0
   if (store.currentPage >= store.pageCount) store.currentPage = Math.max(0, store.pageCount - 1)
   if (c) store.signature = detectSignatures(c)

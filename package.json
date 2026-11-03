@@ -5,13 +5,16 @@
   "type": "module",
   "description": "deePDF \u2013 low-level, in-browser PDF structure editor",
   "scripts": {
+    "predev": "node scripts/copy-pdfjs-assets.mjs",
     "dev": "vite",
+    "prebuild": "node scripts/copy-pdfjs-assets.mjs",
     "build": "vite build",
     "preview": "vite preview",
     "sample": "node scripts/make-sample.mjs sample.pdf",
     "selftest": "node scripts/selftest.mjs"
   },
   "dependencies": {
+    "opentype.js": "^2.0.0",
     "pako": "^2.1.0",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^6.5.438",
