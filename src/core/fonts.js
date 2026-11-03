@@ -16,7 +16,14 @@ for (const enc of [Encodings.Symbol, Encodings.ZapfDingbats, Encodings.WinAnsi])
     if (enc === Encodings.WinAnsi) WINANSI_CODE_TO_NAME[code] = name
   }
 }
-for (const [cp, [, name]] of Object.entries(Encodings.WinAnsi.unicodeMappings)) NAME_TO_UNI.set(name, String.fromCodePoint(+cp))
+{
+  const seen = new Set()
+  for (const [cp, [, name]] of Object.entries(Encodings.WinAnsi.unicodeMappings).sort((a, b) => a[0] - b[0])) {
+    if (seen.has(name)) continue
+    seen.add(name)
+    NAME_TO_UNI.set(name, String.fromCodePoint(+cp))
+  }
+}
 const HEBREW = ['alef', 'bet', 'gimel', 'dalet', 'he', 'vav', 'zayin', 'het', 'tet', 'yod', 'finalkaf', 'kaf', 'lamed', 'finalmem', 'mem', 'finalnun', 'nun', 'samekh', 'ayin', 'finalpe', 'pe', 'finaltsadi', 'tsadi', 'qof', 'resh', 'shin', 'tav']
 HEBREW.forEach((n, i) => {
   const ch = String.fromCharCode(0x05d0 + i)

@@ -23,6 +23,34 @@ const result = ref(null)
 const busy = ref(false)
 const jsonDecode = ref(true)
 
+/* ---------- HTML ---------- */
+const html = ref(null)
+const htmlBusy = ref('')
+const htmlScale = ref(2)
+async function buildHtmlExport() {
+  html.value = null
+  htmlBusy.value = 'Loading…'
+  try {
+    const { buildHtml } = await import('../core/htmlExport.js')
+    const info = ctx().trailerInfo.Info
+    void info
+    html.value = await buildHtml({
+      scale: +htmlScale.value,
+      title: baseName(),
+      onProgress: (i, n, phase) => { htmlBusy.value = `${phase === 'drawing' ? 'Converting' : 'Verifying'} page ${i + 1} / ${n}…` },
+    })
+  } catch (e) {
+    console.error(e)
+    notify('HTML export failed: ' + (e.message || e), 'error', 8000)
+  } finally {
+    htmlBusy.value = ''
+  }
+}
+function downloadHtml() {
+  download(new Blob([html.value.html], { type: 'text/html' }), `${baseName()}.html`)
+}
+const pct = (v) => (v === undefined ? '–' : (Math.floor(v * 1000) / 10).toFixed(1) + '%')
+
 onMounted(() => { report.value = validate(ctx()) })
 
 const tips = {
@@ -103,6 +131,34 @@ function exportJson() {
           <div v-for="(i, k) in report.issues" :key="k" :class="{ 'text-red-300': i.level === 'error', 'text-amber-300': i.level === 'warn', 'text-sky-300': i.level === 'fix', 'text-zinc-400': i.level === 'info' }">
             • {{ i.msg }}
             <div v-if="i.items" class="ml-3 max-h-20 overflow-auto font-mono text-[10px] text-zinc-500">{{ i.items.join('  ') }}</div>
+          </div>
+        </section>
+
+        <section class="rounded border border-zinc-700 p-2">
+          <h3 class="mb-1.5 flex items-center gap-2 font-semibold text-zinc-300">HTML (print-faithful)
+            <span class="font-normal text-zinc-500" v-tip="'Self-contained HTML: each page is an inline SVG. Vector drawings become individual <path> elements, text becomes editable <text> using the embedded fonts, raster images stay images. The result is rendered again and compared pixel by pixel with the PDF rendering.'">ⓘ</span>
+          </h3>
+          <div class="flex flex-wrap items-center gap-2">
+            <label class="flex items-center gap-1 text-zinc-400" v-tip="'Internal resolution (units per point). Higher = more precise coordinates and sharper rasterised fallbacks (patterns/soft masks).'">resolution
+              <select v-model="htmlScale" class="inp"><option :value="1">1×</option><option :value="2">2×</option><option :value="3">3×</option></select>
+            </label>
+            <button class="btn" :disabled="!!htmlBusy" @click="buildHtmlExport">{{ htmlBusy || 'Build & verify HTML' }}</button>
+            <button v-if="html" class="btn btn-primary" @click="downloadHtml">⇩ HTML ({{ fmtBytes(html.summary.bytes) }})</button>
+          </div>
+          <div v-if="html" class="mt-2 space-y-1">
+            <div :class="html.summary.minSimilarity >= 0.995 ? 'text-emerald-300' : html.summary.minSimilarity >= 0.97 ? 'text-amber-300' : 'text-red-300'">
+              Lowest page match: <b>{{ pct(html.summary.minSimilarity) }}</b> of drawn pixels identical to the PDF rendering
+              · {{ html.summary.paths }} vector paths · {{ html.summary.texts }} text runs · {{ html.summary.rasterImages }} raster images<template v-if="html.summary.patterns"> · {{ html.summary.patterns }} rasterised patterns</template>
+            </div>
+            <div v-if="html.summary.untranslatedRuns" class="text-zinc-400" v-tip="'These text runs use fonts whose codes could not be mapped to Unicode (no ToUnicode); they still render exactly but contain private-use characters.'">{{ html.summary.untranslatedRuns }} text run(s) without Unicode text</div>
+            <div v-if="html.summary.missingFonts.length" class="text-amber-300">Fonts without embeddable data (system fallback): {{ html.summary.missingFonts.join(', ') }}</div>
+            <div v-if="html.summary.unsupported.length" class="text-amber-300">Approximated: {{ html.summary.unsupported.join(' · ') }}</div>
+            <div class="flex flex-wrap gap-2 pt-1">
+              <div v-for="p in html.pages" :key="p.index" class="text-center" v-tip="'Red = pixels that differ from the PDF rendering, grey = matching ink'">
+                <img v-if="p.diffUrl" :src="p.diffUrl" class="h-24 rounded border border-zinc-700 bg-white" alt="" />
+                <div class="text-[10px]" :class="p.similarity >= 0.995 ? 'text-emerald-300' : 'text-amber-300'">p{{ p.index + 1 }} · {{ pct(p.similarity) }}</div>
+              </div>
+            </div>
           </div>
         </section>
 
