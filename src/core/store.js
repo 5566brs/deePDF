@@ -40,6 +40,7 @@ export const store = reactive({
   mobileView: 'editor',
   objectFocus: null, // ref tag to reveal in objects tab
   moveTarget: null, // { page, rect, kind } – selection the preview can drag
+  marquee: null, // { page, rect, additive, n } – box selection from the preview
   moveRequest: null, // { page, dx, dy, kind, n } – drag result from the preview
 })
 

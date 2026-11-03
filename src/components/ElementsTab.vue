@@ -254,11 +254,11 @@ function focusRun(r) { locate(store.currentPage, opFocusBox(boxes.value, r.index
 const isTranslation = (o) => o && o.op === 'cm' && o.args.length === 6 && ['1', '0', '0', '1'].every((v, k) => parseFloat(o.args[k].v) === +v)
 const numTok = (v) => ({ t: 'num', v: String(Math.round(v * 10000) / 10000) })
 /** Move selected elements by (dx, dy) page points: wrap in q [translate] cm … Q, or update an existing translation. */
-function actTranslate(dxPage, dyPage) {
-  if (!moveInfo.value.ok || (!dxPage && !dyPage)) return
+function translatedOps(dxPage, dyPage) {
   const s = effectiveSel()
   const det = boxes.value.details || []
-  rebuild(`Move element(s) by ${dxPage}, ${dyPage}`, (parent, kids) => kids.map((k) => {
+  const out = []
+  emitNode(analysis.value.tree, (parent, kids) => kids.map((k) => {
     if (!s.has(k.id)) return k
     const seg = []
     emitNode(k, null, seg)
@@ -270,8 +270,40 @@ function actTranslate(dxPage, dyPage) {
       return { raw: [seg[0], cm, ...seg.slice(2)] }
     }
     return { raw: [{ op: 'q', args: [] }, { op: 'cm', args: [numTok(1), numTok(0), numTok(0), numTok(1), numTok(lx), numTok(ly)] }, ...seg, { op: 'Q', args: [] }] }
-  }))
+  }), out)
+  return out
 }
+
+/** Combined move state for selected content elements + selected annotations. */
+const moveState = computed(() => {
+  const nContent = selNodes.value.length
+  const nAnn = annSel.value.size
+  if (!nContent && !nAnn) return { ok: false, reason: 'Select elements to move them (Shift/Ctrl-click or drag a box in the preview to select several)' }
+  if (nContent && !moveInfo.value.ok) return moveInfo.value
+  let box = nContent ? moveInfo.value.box : null
+  const ab = annSelRect.value
+  if (ab) box = box ? [Math.min(box[0], ab[0]), Math.min(box[1], ab[1]), Math.max(box[2], ab[2]), Math.max(box[3], ab[3])] : ab
+  const parts = []
+  if (nContent) parts.push(`${nContent} element${nContent > 1 ? 's' : ''}`)
+  if (nAnn) parts.push(`${nAnn} annotation${nAnn > 1 ? 's' : ''}`)
+  return { ok: true, box, label: parts.join(' + '), nContent, nAnn }
+})
+/** Move everything selected by (dx, dy) page points in one undo step. */
+function moveAll(dxPage, dyPage) {
+  const st = moveState.value
+  if (!st.ok || (!dxPage && !dyPage)) return
+  const out = st.nContent ? translatedOps(dxPage, dyPage) : null
+  const annIdx = [...annSel.value]
+  mutate(`Move ${st.label} by ${dxPage}, ${dyPage}`, (c) => {
+    const pg = listPages(c)[store.currentPage]
+    if (out) writePageOps(c, pg.dict, out)
+    if (annIdx.length) {
+      const arr = deref(c, pg.dict.get(N('Annots')))
+      if (arr instanceof PDFArray) for (const i of annIdx) { const d = deref(c, arr.get(i)); if (d instanceof PDFDict) shiftAnnotation(c, d, dxPage, dyPage) }
+    }
+  })
+}
+function actTranslate(dx, dy) { moveAll(dx, dy) }
 
 
 function effectiveSel() {
@@ -417,6 +449,10 @@ const annSelRect = computed(() => {
   for (const a of annots.value) if (annSel.value.has(a.i) && a.rect) box = box ? [Math.min(box[0], a.rect[0]), Math.min(box[1], a.rect[1]), Math.max(box[2], a.rect[2]), Math.max(box[3], a.rect[3])] : a.rect.slice()
   return box
 })
+function annRowClick(a, e) {
+  if (e.shiftKey || e.ctrlKey || e.metaKey) { const s2 = new Set(annSel.value); s2.has(a.i) ? s2.delete(a.i) : s2.add(a.i); annSel.value = s2 }
+  else annSel.value = new Set([a.i])
+}
 function annShift(dxp, dyp) {
   const s = [...annSel.value]
   if (!s.length || (!dxp && !dyp)) return
@@ -551,7 +587,7 @@ watch(() => store.pick, async (p) => {
   if (!p || p.page !== store.currentPage || store.tab !== 'elements' || !analysis.value) return
   let best = null, bestArea = Infinity, bestPath = []
   const visit = (n, path) => {
-    if (n.id !== 'root') {
+    if (n.id !== 'root' && MOVABLE.has(n.type) && !n.ptypes.includes('text')) {
       const b = nodeBox(n, boxes.value)
       if (b && p.x >= b[0] - 2 && p.x <= b[2] + 2 && p.y >= b[1] - 2 && p.y <= b[3] + 2) {
         const area = Math.max(1, (b[2] - b[0]) * (b[3] - b[1]))
@@ -561,9 +597,41 @@ watch(() => store.pick, async (p) => {
     if (n.children) n.children.forEach((c) => visit(c, [...path, n.id]))
   }
   visit(analysis.value.tree, [])
+  // an element that only constructs a path (painted after its Q) is useless to move on its own: climb to a painter
+  const PAINT = new Set(['S', 's', 'f', 'F', 'f*', 'B', 'B*', 'b', 'b*', 'Tj', 'TJ', "'", '"', 'Do', 'sh', 'BI'])
+  const paints = (n) => { for (let k = n.from; k <= n.to; k++) if (PAINT.has(ops.value[k].op)) return true; return false }
+  while (best && !paints(best) && bestPath.length) {
+    const parentId = bestPath[bestPath.length - 1]
+    const parent = nodeById(parentId)
+    if (!parent || !MOVABLE.has(parent.type)) break
+    best = parent
+    bestPath = bestPath.slice(0, -1)
+  }
   // links: a click inside a link rectangle opens its target editor
   const link = annots.value.find((a) => a.subtype === 'Link' && a.rect && p.x >= a.rect[0] && p.x <= a.rect[2] && p.y >= a.rect[1] && p.y <= a.rect[3])
   const bestHasText = best && textRuns(ops.value, boxes.value.details || [], best.from, best.to, opEnv.font).length > 0
+  const additive = !!p.additive
+  if (additive && !p.edit) {
+    // Shift/Ctrl-click: add or remove the element under the pointer (a link if there is no content)
+    let removing = false
+    if (best) {
+      const s2 = new Set(sel.value)
+      removing = s2.has(best.id)
+      removing ? s2.delete(best.id) : s2.add(best.id)
+      sel.value = s2
+      const ex = new Set(expanded.value); bestPath.forEach((id) => ex.add(id)); expanded.value = ex
+    }
+    if (link) {
+      // a link over the clicked content follows it, so both move together
+      const a2 = new Set(annSel.value)
+      if (best) removing ? a2.delete(link.i) : a2.add(link.i)
+      else a2.has(link.i) ? a2.delete(link.i) : a2.add(link.i)
+      annSel.value = a2
+    }
+    return
+  }
+  if (!best && !link) { sel.value = new Set(); annSel.value = new Set(); return }
+  if (!link) annSel.value = new Set()
   if (link) {
     annSel.value = new Set([link.i])
     linkOpen.value = new Set([...linkOpen.value, link.i])
@@ -592,17 +660,55 @@ watch(() => store.pick, async (p) => {
 }, { immediate: true })
 
 // let the preview show a draggable box for the selection
-watch([moveInfo, () => store.tab, annSelRect], () => {
+watch([moveState, () => store.tab], () => {
   if (store.tab !== 'elements') { store.moveTarget = null; return }
-  if (moveInfo.value.ok && moveInfo.value.box) store.moveTarget = { page: store.currentPage, rect: moveInfo.value.box, kind: 'content' }
-  else if (annSelRect.value) store.moveTarget = { page: store.currentPage, rect: annSelRect.value, kind: 'annot' }
-  else store.moveTarget = null
+  const st = moveState.value
+  store.moveTarget = st.ok && st.box ? { page: store.currentPage, rect: st.box, kind: 'all', label: st.label } : null
 })
 watch(() => store.moveRequest, (r) => {
   if (!r || r.page !== store.currentPage) return
-  if (r.kind === 'annot') annShift(r.dx, r.dy)
-  else actTranslate(r.dx, r.dy)
+  moveAll(r.dx, r.dy)
 })
+
+// rubber-band selection from the preview
+watch(() => store.marquee, async (m) => {
+  if (!m || !analysis.value) return
+  if (m.page !== store.currentPage) store.currentPage = m.page
+  store.tab = 'elements'
+  await nextTick()
+  const [x1, y1, x2, y2] = m.rect
+  const inside = (b) => b && b[0] >= x1 - 1 && b[1] >= y1 - 1 && b[2] <= x2 + 1 && b[3] <= y2 + 1
+  const picked = []
+  const parents = []
+  const visit = (n, path) => {
+    if (n.id !== 'root') {
+      const b = nodeBox(n, boxes.value)
+      if (MOVABLE.has(n.type) && !n.ptypes.includes('text') && inside(b)) { picked.push(n.id); parents.push(...path); return }
+    }
+    if (n.children) n.children.forEach((c) => visit(c, n.id === 'root' ? path : [...path, n.id]))
+  }
+  visit(analysis.value.tree, [])
+  const anns = annots.value.filter((a) => inside(a.rect)).map((a) => a.i)
+  sel.value = new Set([...(m.additive ? sel.value : []), ...picked])
+  annSel.value = new Set([...(m.additive ? annSel.value : []), ...anns])
+  const ex = new Set(expanded.value); parents.forEach((id) => ex.add(id)); expanded.value = ex
+  if (!picked.length && !anns.length) notify('No complete element inside the box', 'info', 1500)
+})
+
+// arrow keys move the selection when no input has focus
+function onKeyMove(e) {
+  if (store.tab !== 'elements') return
+  const t = e.target
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return
+  if (e.key === 'Escape') { sel.value = new Set(); annSel.value = new Set(); return }
+  const map = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1] }
+  if (!map[e.key] || !moveState.value.ok) return
+  e.preventDefault()
+  const k = e.shiftKey ? 10 : 1
+  moveAll(map[e.key][0] * k, map[e.key][1] * k)
+}
+window.addEventListener('keydown', onKeyMove)
+onBeforeUnmount(() => window.removeEventListener('keydown', onKeyMove))
 onBeforeUnmount(() => { store.moveTarget = null })
 </script>
 
@@ -621,7 +727,7 @@ onBeforeUnmount(() => { store.moveTarget = null })
         <button class="btn" :class="{ 'border-cyan-600 text-cyan-300': rawOpen }" v-tip="'Edit the whole decoded content stream as text'" @click="rawOpen = !rawOpen">Raw</button>
       </div>
       <div class="mt-1 flex flex-wrap items-center gap-1">
-        <span class="text-[11px]" :class="sel.size ? 'text-cyan-300' : 'text-zinc-500'">{{ sel.size ? `${sel.size} selected` : 'No selection' }}</span>
+        <span class="text-[11px]" :class="sel.size ? 'text-cyan-300' : 'text-zinc-500'">{{ sel.size || annSel.size ? moveState.label || `${sel.size} selected` : 'No selection' }}</span>
         <button class="btn" :disabled="!sel.size" v-tip="'Move up = draw earlier (further back)'" @click="actMove(-1)">▲</button>
         <button class="btn" :disabled="!sel.size" v-tip="'Move down = draw later (further front)'" @click="actMove(1)">▼</button>
         <button class="btn" :disabled="!sel.size" v-tip="'Send to back (first among siblings)'" @click="actZ(false)">⤒</button>
@@ -633,7 +739,7 @@ onBeforeUnmount(() => { store.moveTarget = null })
         <div class="flex-1" />
         <button class="btn" v-tip="'Export selected elements (or all) as PDF content syntax'" @click="exportSel('txt')">⇩ txt</button>
         <button class="btn" v-tip="'Export selected elements (or all) as JSON (operators, bounding boxes, text)'" @click="exportSel('json')">⇩ json</button>
-        <button v-if="sel.size" class="btn" @click="sel = new Set()">Clear</button>
+        <button v-if="sel.size || annSel.size" class="btn" v-tip="'Clear selection (Esc)'" @click="sel = new Set(); annSel = new Set()">Clear</button>
       </div>
     </div>
 
@@ -648,7 +754,7 @@ onBeforeUnmount(() => { store.moveTarget = null })
       </div>
     </div>
 
-    <QuickEdit v-if="sel.size" :runs="quickRuns" :move="moveInfo" :rev="store.rev" @apply-text="applyRunText" @move="actTranslate" @focus-run="focusRun" />
+    <QuickEdit v-if="sel.size || annSel.size" :runs="quickRuns" :move="moveState" :rev="store.rev" @apply-text="applyRunText" @move="actTranslate" @focus-run="focusRun" />
 
     <div class="section-title">Content <span class="font-normal normal-case text-zinc-500">· click an element in the preview to find it · double-click text to edit it</span></div>
     <div class="rounded-md border border-zinc-800 bg-zinc-900/60 py-1">
@@ -680,7 +786,7 @@ onBeforeUnmount(() => { store.moveTarget = null })
         <button class="btn btn-danger" :disabled="!annSel.size" @click="annDelete">Delete</button>
       </div>
       <div v-for="a in annots" :key="a.i + ':' + (a.ref?.objectNumber ?? 'd')" :data-annot="a.i" class="border-b border-zinc-800/60 last:border-0">
-        <div class="flex items-center gap-1.5 px-1 py-1 text-xs hover:bg-zinc-700/30" :class="{ 'row-sel': annSel.has(a.i) }" tabindex="0" @focus="annFocus(a)" @click="annFocus(a); annSel = new Set([a.i])">
+        <div class="flex items-center gap-1.5 px-1 py-1 text-xs hover:bg-zinc-700/30" :class="{ 'row-sel': annSel.has(a.i) }" tabindex="0" @focus="annFocus(a)" @click="annFocus(a); annRowClick(a, $event)">
           <input type="checkbox" :checked="annSel.has(a.i)" @click.stop="annToggleSel(a.i)" />
           <button class="w-4 text-zinc-500" @click.stop="annToggleOpen(a.i)">{{ annOpen.has(a.i) ? '▾' : '▸' }}</button>
           <span class="tag bg-yellow-900/60 text-yellow-200">{{ a.subtype }}</span>

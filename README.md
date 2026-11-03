@@ -25,8 +25,12 @@ Cloudflare Pages.
 * **Text**: double-click text in the preview (or select a text element) and a quick-edit field with the readable
   text opens and is focused. Enter applies; the text is encoded through the font, with feedback for characters
   the (subset) font lacks. In `TJ` arrays kerning is kept when the number of characters is unchanged.
+* **Multi-select**: Shift/Ctrl-click elements in the preview (or in the tree) to add/remove them, or drag a box
+  on the page to select every element completely inside it (Shift adds to the selection). Links over clicked text
+  are selected with it. Esc clears the selection.
 * **Move**: selected drawings, images, text objects and groups can be moved with arrow buttons / keys (Shift = ×10),
-  exact dx/dy, or by dragging the dashed selection box in the preview. The move is written as
+  exact dx/dy, or by dragging the dashed selection box in the preview; content elements and annotations in the
+  selection move together in one undo step. The move is written as
   `q 1 0 0 1 dx dy cm … Q` (an existing translation wrapper is updated instead of nesting), converted into the
   element's local coordinate system so the distance is exact in page points. Parts inside a `BT…ET` text object
   cannot be moved on their own (the whole text object can). Annotations move by shifting `Rect`, `QuadPoints`,

@@ -95,7 +95,7 @@ function onKey(e) {
         <label class="flex items-center gap-0.5 text-[10px] text-zinc-500">dx<input v-model.number="mx" type="number" step="any" class="inp w-14" /></label>
         <label class="flex items-center gap-0.5 text-[10px] text-zinc-500">dy<input v-model.number="my" type="number" step="any" class="inp w-14" /></label>
         <button class="btn" :disabled="!mx && !my" @click="emit('move', +mx || 0, +my || 0); mx = 0; my = 0">Apply</button>
-        <span class="text-[10px] text-zinc-500">{{ move.label }} · arrow keys work here · or drag the dashed box in the preview</span>
+        <span class="text-[10px] text-zinc-500">{{ move.label }} · arrow keys (Shift ×10) · or drag the dashed box in the preview</span>
       </template>
       <span v-else class="text-[10px] text-amber-300/90">{{ move.reason }}</span>
     </div>

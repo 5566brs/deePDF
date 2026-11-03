@@ -102,11 +102,48 @@ function pdfPoint(e) {
   const rect = root.value.getBoundingClientRect()
   return viewport.value.convertToPdfPoint(e.clientX - rect.left, e.clientY - rect.top)
 }
+let suppressClick = false
 function onClick(e, edit = false) {
   if (!viewport.value) return
+  if (suppressClick) { suppressClick = false; return }
   const [x, y] = pdfPoint(e)
-  emit('pick', { page: props.index, x, y, edit })
+  emit('pick', { page: props.index, x, y, edit, additive: !!(e.shiftKey || e.ctrlKey || e.metaKey) })
 }
+
+/* ---------- rubber-band selection ---------- */
+const band = ref(null) // { x0, y0, x1, y1 } in page px, active once moved
+let bandStart = null
+function bandDown(e) {
+  if (e.button !== 0 || !viewport.value) return
+  const r = root.value.getBoundingClientRect()
+  bandStart = { x: e.clientX - r.left, y: e.clientY - r.top, id: e.pointerId, additive: e.shiftKey || e.ctrlKey || e.metaKey }
+}
+function bandMove(e) {
+  if (!bandStart) return
+  const r = root.value.getBoundingClientRect()
+  const x = e.clientX - r.left, y = e.clientY - r.top
+  if (!band.value && Math.abs(x - bandStart.x) + Math.abs(y - bandStart.y) < 6) return
+  if (!band.value) root.value.setPointerCapture(bandStart.id)
+  band.value = { x0: bandStart.x, y0: bandStart.y, x1: x, y1: y }
+  e.preventDefault()
+}
+function bandUp() {
+  const b = band.value
+  const st = bandStart
+  bandStart = null
+  band.value = null
+  if (!b) return
+  suppressClick = true
+  setTimeout(() => { suppressClick = false }, 300)
+  const [ax, ay] = viewport.value.convertToPdfPoint(b.x0, b.y0)
+  const [bx, by] = viewport.value.convertToPdfPoint(b.x1, b.y1)
+  store.marquee = { page: props.index, rect: [Math.min(ax, bx), Math.min(ay, by), Math.max(ax, bx), Math.max(ay, by)], additive: st.additive, n: Math.random() }
+}
+const bandStyle = computed(() => {
+  const b = band.value
+  if (!b) return null
+  return { left: Math.min(b.x0, b.x1) + 'px', top: Math.min(b.y0, b.y1) + 'px', width: Math.abs(b.x1 - b.x0) + 'px', height: Math.abs(b.y1 - b.y0) + 'px' }
+})
 
 /* ---------- drag to move the selection ---------- */
 const drag = ref(null) // { sx, sy, ox, oy }
@@ -142,7 +179,7 @@ function dragEnd(e) {
 </script>
 
 <template>
-  <div ref="root" class="relative mx-auto bg-white shadow-lg shadow-black/50" :style="{ width: size.w + 'px', height: size.h + 'px' }" :data-page="index" @click="onClick($event)" @dblclick="onClick($event, true)">
+  <div ref="root" class="relative mx-auto bg-white shadow-lg shadow-black/50" :style="{ width: size.w + 'px', height: size.h + 'px' }" :data-page="index" @click="onClick($event)" @dblclick="onClick($event, true)" @pointerdown="bandDown" @pointermove="bandMove" @pointerup="bandUp" @pointercancel="bandUp">
     <div ref="holder" class="absolute inset-0" />
     <div v-if="failed" class="absolute inset-0 flex items-center justify-center p-4 text-center text-xs text-red-600">Render error: {{ failed }}</div>
     <div v-if="hl" :key="hl.n" class="locate-ring" :class="{ 'is-point': hl.point }" :style="{ left: hl.x - 2 + 'px', top: hl.y - 2 + 'px', width: hl.w + 4 + 'px', height: hl.h + 4 + 'px' }" />
@@ -150,13 +187,14 @@ function dragEnd(e) {
       v-if="moveBox"
       class="absolute cursor-move rounded-sm border-2 border-dashed border-amber-400/90 bg-amber-300/5 hover:bg-amber-300/15"
       :style="{ left: moveBox.x - 3 + 'px', top: moveBox.y - 3 + 'px', width: moveBox.w + 6 + 'px', height: moveBox.h + 6 + 'px', transform: drag ? `translate(${drag.ox}px, ${drag.oy}px)` : '' }"
-      title="Drag to move the selection · double-click to edit its text"
+      :title="`Drag to move ${store.moveTarget?.label || 'the selection'} · Shift/Ctrl-click to add or remove · double-click to edit text`"
       @click.stop
       @dblclick.stop="onClick($event, true)"
       @pointerdown.stop="dragStart"
       @pointermove="dragMove"
       @pointerup="dragEnd"
     />
+    <div v-if="bandStyle" class="pointer-events-none absolute border border-cyan-400 bg-cyan-400/10" :style="bandStyle" />
     <div class="absolute -left-1 top-0 -translate-x-full pr-1 font-mono text-[10px] text-zinc-500 select-none">{{ index + 1 }}</div>
   </div>
 </template>
